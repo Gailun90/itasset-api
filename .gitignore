@@ -9,3 +9,7 @@ data/
 packages/
 *.db
 .DS_Store
+
+# 备份目录
+app_backup_*/
+*.bak

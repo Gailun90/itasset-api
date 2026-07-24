@@ -52,7 +52,7 @@ async def create_group(
 async def update_group(
     group_id:    int,
     name:        str = "",
-    description: str = "",
+    description: Optional[str] = None,
     _:  bool = Depends(require_glpi_token),
     db: AsyncSession = Depends(get_db),
 ):
@@ -62,7 +62,8 @@ async def update_group(
         raise HTTPException(404, "分组不存在")
     if name:
         g.name = name
-    g.description = description
+    if description is not None:   # 只在显式传入时更新，避免只改名时清空描述
+        g.description = description
     await db.commit()
     return OkResponse(message=f"已更新分组：{g.name}")
 

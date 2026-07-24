@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, text
 from app.core.database import get_db
 from app.core.security import generate_device_secret, hash_secret
 from app.core.deps import require_initial_token, require_agent_auth, require_glpi_token
@@ -36,15 +36,47 @@ async def register_client(
     _: bool = Depends(require_initial_token),
     db: AsyncSession = Depends(get_db),
 ):
-    """设备首次注册，下发唯一 DeviceSecret（双段式认证第一段）"""
+    """
+    设备首次注册，下发唯一 DeviceSecret（双段式认证第一段）
+    
+    🔒 安全修复 v6.1：
+    - 已注册设备重新注册需要验证原 DeviceSecret（防 Token 劫持）
+    - 使用 SELECT FOR UPDATE SKIP LOCKED 防止竞态条件
+    """
     secret      = generate_device_secret()
     secret_hash = hash_secret(secret)
     client_ip   = request.client.host if request.client else None
 
-    # upsert Client
-    result = await db.execute(select(Client).where(Client.hash_serial == body.hash_serial))
+    # 🔒 修复竞态条件：使用 FOR UPDATE 锁
+    # 先尝试查找现有记录（加锁）
+    result = await db.execute(
+        select(Client).where(Client.hash_serial == body.hash_serial).with_for_update()
+    )
     client = result.scalar_one_or_none()
+    
     if client:
+        # 🔒 修复安全问题：已注册设备重新注册需要验证原 DeviceSecret
+        # 检查请求中是否提供了原 DeviceSecret（无损恢复场景）
+        old_secret = body.old_device_secret
+        if old_secret:
+            # 验证原 DeviceSecret
+            from app.core.security import verify_device_secret
+            if not verify_device_secret(old_secret, client.device_secret_hash):
+                logger.warning(f"Register: invalid old_device_secret for {body.hash_serial}")
+                raise HTTPException(
+                    status_code=403,
+                    detail="设备已注册，提供的原 DeviceSecret 无效。请联系管理员。"
+                )
+            logger.info(f"Register: re-register with valid old secret: {body.hash_serial}")
+        else:
+            # 无原 DeviceSecret：拒绝重新注册（需要管理员审批）
+            logger.warning(f"Register: rejected re-register without old_secret: {body.hash_serial}")
+            raise HTTPException(
+                status_code=403,
+                detail="设备已注册，请提供原 DeviceSecret 或联系管理员审批重新注册"
+            )
+        
+        # 验证通过：更新 DeviceSecret
         client.hostname           = body.hostname
         client.ip                 = body.ip or client_ip
         client.device_secret_hash = secret_hash
@@ -54,6 +86,7 @@ async def register_client(
         if body.machine_guid:
             client.machine_guid   = body.machine_guid
     else:
+        # 新设备：创建
         client = Client(
             hash_serial=body.hash_serial, hostname=body.hostname,
             bios_serial=getattr(body, 'bios_serial', None),
@@ -68,7 +101,7 @@ async def register_client(
 
     # upsert DeviceRegistration
     reg_res = await db.execute(
-        select(DeviceRegistration).where(DeviceRegistration.hash_serial == body.hash_serial)
+        select(DeviceRegistration).where(DeviceRegistration.hash_serial == body.hash_serial).with_for_update(skip_locked=True)
     )
     reg = reg_res.scalar_one_or_none()
     if reg:
@@ -103,8 +136,11 @@ async def report_assets(
     client.os        = body.os
     client.cpu       = body.cpu
     client.memory_gb = body.memory_gb
-    client.bios_serial = getattr(body, 'bios_serial', None)
-    client.machine_guid = getattr(body, 'machine_guid', None)
+    # 🔒 修复问题3：只在字段存在时才更新（防止清空已有值）
+    if body.bios_serial is not None:
+        client.bios_serial = body.bios_serial
+    if body.machine_guid is not None:
+        client.machine_guid = body.machine_guid
     client.disk_info = [d.model_dump() for d in body.disk_info] if body.disk_info else client.disk_info
     client.last_seen = now
 
@@ -133,6 +169,7 @@ async def get_tasks(
     from datetime import timedelta
     now = datetime.now(timezone.utc)
 
+    # 🔒 修复问题8：先不标记 running，等过滤完再标记（防止卡在 running）
     # ── Step 1: stale running tasks → JOIN with Task to get timeout ──
     stale_rows = await db.execute(
         select(TaskTarget, Task.timeout)
@@ -153,7 +190,7 @@ async def get_tasks(
         await db.commit()
         logger.warning(f"Stale tasks reset: {stale_count}")
 
-    # ── Step 2: fetch pending/deferred TaskTargets ──
+    # ── Step 2: fetch pending/deferred TaskTargets (不先标记 running) ──
     tt_result = await db.execute(
         select(TaskTarget).where(
             TaskTarget.client_id == client.id,
@@ -164,12 +201,7 @@ async def get_tasks(
     if not targets:
         return []
 
-    # Mark running immediately
-    for tt in targets:
-        tt.status = "running"
-        tt.started_at = now
-    await db.commit()
-
+    # 🔒 修复问题8：先过滤，只对最终下发的 target 标记 running
     # ── Step 3: batch-fetch all needed Tasks in ONE query ──
     task_ids = [tt.task_id for tt in targets]
     task_map: dict = {}
@@ -183,9 +215,25 @@ async def get_tasks(
         for t in task_rows.scalars().all():
             task_map[t.id] = t
 
+    # 🔒 修复问题8：过滤掉 Task 不存在或非 active 的 target
+    valid_targets = []
+    for tt in targets:
+        task = task_map.get(tt.task_id)
+        if task:
+            valid_targets.append((tt, task))
+
+    if not valid_targets:
+        return []
+
+    # 🔒 修复问题8：现在才标记 running（只对有效 target）
+    for tt, _ in valid_targets:
+        tt.status = "running"
+        tt.started_at = now
+    await db.commit()
+
     # ── Step 4: batch-fetch all needed Packages in ONE query ──
     pkg_ids = [
-        t.package_id for t in task_map.values()
+        t.package_id for _, t in valid_targets
         if t.package_id is not None]
     pkg_map: dict = {}
     if pkg_ids:
@@ -208,11 +256,7 @@ async def get_tasks(
 
     # ── Step 6: build output from in-memory maps (zero DB queries) ──
     tasks_out = []
-    for tt in targets:
-        task = task_map.get(tt.task_id)
-        if not task:
-            continue
-
+    for tt, task in valid_targets:
         if task.task_type == "uninstall":
             tasks_out.append(TaskOut(
                 target_id=tt.id,
@@ -259,6 +303,7 @@ async def get_tasks(
                 f"{settings.SERVER_URL}/api/packages/download/{pkg.filename}"),
         ))
     return tasks_out
+
 @router.post("/tasks/{target_id}/result", response_model=OkResponse)
 async def report_task_result(
     target_id: int,
@@ -382,8 +427,13 @@ async def report_audit_action(
     db: AsyncSession = Depends(get_db),
 ):
     """上报 SYSTEM 权限执行的进程审计日志"""
+    # serial / hash_serial 二选一兼容（schema 两者均为 Optional，至少一个必填）
+    serial = body.serial or body.hash_serial
+    if not serial:
+        raise HTTPException(status_code=400, detail="serial 或 hash_serial 字段缺失")
+    
     db.add(ActionAudit(
-        hash_serial=body.hash_serial,
+        hash_serial=serial,
         client_id=client.id,
         process_path=body.process_path,
         arguments=body.arguments,
@@ -394,6 +444,7 @@ async def report_audit_action(
     await db.commit()
     return OkResponse()
 
+
 # ── DELETE /api/clients/{client_id} ───────────────────────────────────────────
 @router.delete("/clients/{client_id}", response_model=OkResponse)
 async def delete_client(
@@ -401,17 +452,23 @@ async def delete_client(
     _: bool = Depends(require_glpi_token),
     db: AsyncSession = Depends(get_db),
 ):
-    """删除客户端及相关联数据（GLPI 插件调用）"""
+    """
+    删除客户端及相关联数据（GLPI 插件调用）
+    
+    🔒 修复问题1：原代码有 NameError (_hostname, _serial 未定义)，
+       且未删除 Client 和 DeviceRegistration，也无 commit
+    """
     from sqlalchemy import delete as sqldelete
     from sqlalchemy import func as sqlfunc
     from app.models.models import TaskTarget, ActionAudit, ClientReport, Task, DeviceRegistration
 
     # 1. 查找客户端
-    result = await db.execute(select(Client).where(Client.id == client_id))
+    result = await db.execute(select(Client).where(Client.id == client_id).with_for_update())
     client = result.scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=404, detail="客户端不存在")
 
+    hostname = client.hostname
     serial = client.hash_serial
 
     # 2. 收集属于该客户端的 task_ids（用于后续孤儿清理）
@@ -424,25 +481,23 @@ async def delete_client(
     await db.execute(sqldelete(TaskTarget).where(TaskTarget.client_id == client_id))
 
     # 4. 删除孤儿 Task（没有剩余 TaskTarget 的）
-    # Batch delete orphan tasks (NOT IN subquery)
-
     if task_ids:
-
-        from sqlalchemy import func as sqlfunc2
-
         non_orphan = await db.execute(
-
             select(TaskTarget.task_id).where(TaskTarget.task_id.in_(task_ids)).distinct()
-
         )
-
         non_orphan_ids = {row[0] for row in non_orphan}
-
         orphan_ids = [tid for tid in task_ids if tid not in non_orphan_ids]
-
         if orphan_ids:
-
             await db.execute(sqldelete(Task).where(Task.id.in_(orphan_ids)))
 
-    logger.info(f"Deleted client #{client_id} ({_hostname}, {_serial})")
-    return OkResponse(message=f"已删除 {_hostname} 及关联数据")
+    # 5. 🔒 修复问题1：删除 DeviceRegistration（之前漏了）
+    await db.execute(sqldelete(DeviceRegistration).where(DeviceRegistration.hash_serial == serial))
+
+    # 6. 🔒 修复问题1：删除 Client 本身（之前漏了）
+    await db.delete(client)
+
+    # 7. 🔒 修复问题1：提交事务（之前漏了）
+    await db.commit()
+
+    logger.info(f"Deleted client #{client_id} ({hostname}, {serial})")
+    return OkResponse(message=f"已删除 {hostname} 及关联数据")

@@ -1,5 +1,9 @@
-﻿"""
+"""
 包管理端点：上传、下载（断点续传）、列表
+
+🔒 安全修复 v6.1：
+- 问题10：阻塞 I/O 改异步（使用 aiofiles）
+- 问题11：Range 请求 start > end 时返回 416
 """
 import hashlib
 import os
@@ -23,7 +27,7 @@ PKG_DIR = Path(settings.PACKAGES_DIR)
 PKG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ── GET /api/packages/download/{filename} ────────────────────────────────────
+# ── GET /api/packages/download/{filename} ──────────────────────────────────
 @router.get("/download/{filename}")
 async def download_package(
     filename: str,
@@ -36,7 +40,11 @@ async def download_package(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="包文件不存在")
 
-    file_size = file_path.stat().st_size
+    import asyncio
+    loop = asyncio.get_event_loop()
+    file_stat = await loop.run_in_executor(None, file_path.stat)
+    file_size = file_stat.st_size
+    
     range_header = request.headers.get("Range")
 
     if range_header:
@@ -46,8 +54,16 @@ async def download_package(
             start_str, _, end_str = range_val.partition("-")
             start = int(start_str) if start_str else 0
             end   = int(end_str)   if end_str   else file_size - 1
+            
+            # 🔒 修复问题11：start > end 时返回 416
+            if start > end:
+                raise HTTPException(status_code=416, detail="Range start > end")
+            
             end   = min(end, file_size - 1)
             length = end - start + 1
+            
+            if length <= 0:
+                raise HTTPException(status_code=416, detail="Range invalid")
 
             def iter_file():
                 with open(file_path, "rb") as f:
@@ -65,9 +81,9 @@ async def download_package(
                 status_code=206,
                 media_type="application/octet-stream",
                 headers={
-                    "Content-Range":  f"bytes {start}-{end}/{file_size}",
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
                     "Content-Length": str(length),
-                    "Accept-Ranges":  "bytes",
+                    "Accept-Ranges": "bytes",
                     "Content-Disposition": f'attachment; filename="{safe_name}"',
                 },
             )
@@ -82,7 +98,7 @@ async def download_package(
     )
 
 
-# ── POST /api/packages/upload ────────────────────────────────────────────────
+# ── POST /api/packages/upload ───────────────────────────────────────────────
 @router.post("/upload", response_model=OkResponse)
 async def upload_package(
     name:        str,
@@ -94,16 +110,24 @@ async def upload_package(
     db:  AsyncSession = Depends(get_db),
 ):
     """上传安装包，自动计算 SHA256"""
+    import aiofiles
     safe_name = Path(file.filename).name
-    dest = PKG_DIR / safe_name
+    tmp_dest  = PKG_DIR / f"_tmp_{safe_name}"
+    MAX_BYTES = 500 * 1024 * 1024   # 500 MB
 
     sha256 = hashlib.sha256()
     size   = 0
-    with open(dest, "wb") as f:
-        while chunk := await file.read(65536):
-            f.write(chunk)
-            sha256.update(chunk)
-            size += len(chunk)
+    try:
+        async with aiofiles.open(tmp_dest, "wb") as f:
+            while chunk := await file.read(65536):
+                size += len(chunk)
+                if size > MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="文件超过 500 MB 限制")
+                await f.write(chunk)
+                sha256.update(chunk)
+    except HTTPException:
+        tmp_dest.unlink(missing_ok=True)
+        raise
 
     file_hash = sha256.hexdigest()
 
@@ -113,23 +137,38 @@ async def upload_package(
     )
     pkg = result.scalar_one_or_none()
     if pkg:
-        pkg.filename    = safe_name
+        # 删除旧磁盘文件
+        old_path = PKG_DIR / pkg.filename
+        if old_path.exists():
+            old_path.unlink()
         pkg.file_hash   = file_hash
         pkg.file_size   = size
         pkg.silent_args = silent_args
         pkg.description = description
+        # 文件名以 {id}_{safe_name} 保证唯一性
+        pkg.filename = f"{pkg.id}_{safe_name}"
+        await db.commit()
     else:
-        db.add(Package(
-            name=name, version=version, filename=safe_name,
+        new_pkg = Package(
+            name=name, version=version, filename=safe_name,  # 先占位
             silent_args=silent_args, file_hash=file_hash,
             file_size=size, description=description,
-        ))
-    await db.commit()
+        )
+        db.add(new_pkg)
+        await db.commit()
+        await db.refresh(new_pkg)
+        # commit 后拿到 id，更新文件名
+        new_pkg.filename = f"{new_pkg.id}_{safe_name}"
+        await db.commit()
+        pkg = new_pkg
+    # 将临时文件移动到最终路径
+    (PKG_DIR / pkg.filename).parent.mkdir(parents=True, exist_ok=True)
+    tmp_dest.rename(PKG_DIR / pkg.filename)
     logger.info(f"Package uploaded: {name} {version} ({size} bytes)")
     return OkResponse(message=f"上传成功，SHA256={file_hash}")
 
 
-# ── GET /api/packages ─────────────────────────────────────────────────────────
+# ── GET /api/packages ─────────────────────────────────────────────────────
 @router.get("")
 async def list_packages(
     _:  bool = Depends(require_glpi_token),
@@ -148,7 +187,7 @@ async def list_packages(
     ]
 
 
-# ── POST /api/packages/register ─────────────────────────────────────────────
+# ── POST /api/packages/register ────────────────────────────────────────────
 @router.post("/register", response_model=OkResponse)
 async def register_package(
     name:        str,
@@ -182,7 +221,7 @@ async def register_package(
     return OkResponse(message=f"包已注册: {name} {version}")
 
 
-# ── DELETE /api/packages/{pkg_id} ────────────────────────────────────────────
+# ── DELETE /api/packages/{pkg_id} ─────────────────────────────────────────
 @router.delete("/{pkg_id}", response_model=OkResponse)
 async def delete_package(
     pkg_id: int,
@@ -207,7 +246,7 @@ async def delete_package(
     return OkResponse(message=f"已删除安装包：{pkg.name} {pkg.version}")
 
 
-# ── PATCH /api/packages/{pkg_id} ─────────────────────────────────────────────
+# ── PATCH /api/packages/{pkg_id} ─────────────────────────────────────────
 @router.patch("/{pkg_id}", response_model=OkResponse)
 async def update_package(
     pkg_id:      int,

@@ -11,6 +11,7 @@ class RegisterRequest(BaseModel):
     hostname: str = Field(..., min_length=1, max_length=255)
     ip:       Optional[str] = None
     initial_token: str
+    old_device_secret: Optional[str] = None   # 重新注册时携带，用于无损恢复
 
 class RegisterResponse(BaseModel):
     device_secret: str
@@ -80,7 +81,8 @@ class TaskLogRequest(BaseModel):
 
 # ── 审计 ──────────────────────────────────────────────────────────────────────
 class AuditActionRequest(BaseModel):
-    serial:       str
+    serial:       Optional[str] = None   # 旧版 Agent 字段
+    hash_serial:  Optional[str] = None   # 新版 Agent 字段，两者至少一个必填
     process_path: str
     arguments:    Optional[str] = None
     pid:          Optional[int] = None
@@ -102,7 +104,7 @@ class DashboardOut(BaseModel):
     pending_tasks:  int
     failed_tasks:   int
     online_serials: list[str] = []
-    version:        str = "4.0.0"
+    version:        str = "1.0.0"
 
 class DiffStatsOut(BaseModel):
     diff_count:     int

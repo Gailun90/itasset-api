@@ -153,8 +153,9 @@ class ConnectionManager:
         return serial
 
     def revoke_session(self, token: str) -> None:
-        serial = self._sessions.pop(token, None)
-        if serial:
+        entry = self._sessions.pop(token, None)
+        if entry:
+            serial, _ = entry  # 🔒 修复问题9：正确解包元组 (serial, expires)
             logger.info(f"Session revoked: {token[:12]}... ({serial})")
 
     async def add_viewer(self, serial: str, ws: WebSocket) -> None:

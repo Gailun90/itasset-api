@@ -65,11 +65,19 @@ async def require_agent_auth(
 async def require_glpi_token(
     authorization: str = Header(...),
 ) -> bool:
-    """GLPI 插件调用：Bearer Token 验证"""
+    """GLPI 插件调用：Bearer Token 验证
+    
+    🔒 安全修复 v6.1：不再回退到 AGENT_INITIAL_TOKEN
+    GLPI_API_TOKEN 必须单独设置，不能与 Agent 初始 Token 相同
+    """
     from app.core.config import get_settings
     settings = get_settings()
+    
+    if not settings.GLPI_API_TOKEN:
+        logger.error("GLPI_API_TOKEN 未配置，拒绝所有 GLPI 端点访问")
+        raise HTTPException(status_code=500, detail="服务器配置错误：GLPI_API_TOKEN 未设置")
+    
     scheme, _, token = authorization.partition(" ")
-    glpi_tok = settings.GLPI_API_TOKEN or settings.AGENT_INITIAL_TOKEN
-    if scheme.lower() != "bearer" or token != glpi_tok:
+    if scheme.lower() != "bearer" or token != settings.GLPI_API_TOKEN:
         raise HTTPException(status_code=401, detail="Token 无效")
     return True

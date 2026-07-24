@@ -4,8 +4,8 @@ from functools import lru_cache
 class Settings(BaseSettings):
     DATABASE_URL: str
     AGENT_INITIAL_TOKEN: str
-    GLPI_API_TOKEN: str = ""         # GLPI插件专用（空则回退到AGENT_INITIAL_TOKEN）
-    ALLOWED_ORIGINS: list[str] = ["*"]  # CORS白名单
+    GLPI_API_TOKEN: str = ""         # GLPI插件专用（空则禁止 GLPI 端点访问，不再回退到 AGENT_INITIAL_TOKEN）
+    ALLOWED_ORIGINS: list[str] = ["http://localhost:8000"]  # CORS白名单（不再允许 "*"）
     SECRET_KEY: str
     SERVER_URL: str = "http://localhost:8000"
     WS_ENDPOINT: str = "ws://localhost:8000/ws/agent/"
@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = "/opt/itasset/.env"
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -103,7 +103,7 @@ class Task(Base):
     interactive:        Mapped[bool]          = mapped_column(Boolean, default=True)
     need_reboot:        Mapped[bool]          = mapped_column(Boolean, default=False)
     timeout:            Mapped[int]           = mapped_column(Integer, default=600)
-    success_codes:      Mapped[Optional[list]]= mapped_column(JSONB, default=list)
+    success_codes:      Mapped[Optional[list]]= mapped_column(JSONB, default=[0])  # 🔒 修复问题22：默认 [0] 而不是空列表
     status:             Mapped[str]           = mapped_column(String(32), default="active")
     maintenance_window: Mapped[Optional[dict]]= mapped_column(JSONB)
     bandwidth_limit_kb: Mapped[Optional[int]] = mapped_column(Integer)

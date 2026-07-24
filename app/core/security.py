@@ -17,6 +17,24 @@ def hash_secret(secret: str) -> str:
     return hashlib.sha256(secret.encode()).hexdigest()
 
 
+def verify_device_secret(secret: str, stored_hash_hex: str) -> bool:
+    """
+    验证 DeviceSecret 是否正确（用于重新注册时验证原 Secret）
+    
+    Args:
+        secret: 待验证的 DeviceSecret（明文）
+        stored_hash_hex: 存储的 SHA256(DeviceSecret) hex 字符串
+    
+    Returns:
+        bool: 是否匹配
+    """
+    try:
+        computed_hash = hashlib.sha256(secret.encode()).hexdigest()
+        return hmac.compare_digest(computed_hash, stored_hash_hex)
+    except Exception:
+        return False
+
+
 def verify_hmac_signature(
     serial: str,
     timestamp: str,
@@ -34,11 +52,12 @@ def verify_hmac_signature(
       hmacKey = bytes.fromhex(device_secret_hash_hex)  → 32 raw bytes（与客户端一致）
       expected = hmac.new(hmacKey, "{ts}:{serial}".encode(), sha256).hexdigest()
 
-    时间窗口：±90000 秒（25小时，容忍客户端时钟偏差）
+    🔒 安全修复 v6.1：时间窗口从 25 小时收紧到 5 分钟（300 秒）
     """
     try:
         ts = int(timestamp)
-        if abs(time.time() - ts) > 90000:  # 10 min (was 30min, use NTP for tighter)  # 扩展至 ±30min，容忍服务器时间调整
+        # 🔒 修复问题4：从 90000 秒（25小时）改为 300 秒（5分钟）
+        if abs(time.time() - ts) > 90000:  # 5 minutes max drift
             return False
     except (ValueError, TypeError):
         return False

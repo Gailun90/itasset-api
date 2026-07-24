@@ -239,7 +239,9 @@ async def create_task(
         clients_res = await db.execute(select(Client).where(Client.group_id == target_id))
         client_ids = [c.id for c in clients_res.scalars().all()]
     else:
-        client_ids = [target_id] if target_id else []
+        if not target_id:
+            raise HTTPException(status_code=400, detail="target_type=client 时 target_id 不能为空")
+        client_ids = [target_id]
 
     for cid in client_ids:
         db.add(TaskTarget(task_id=task.id, client_id=cid))
