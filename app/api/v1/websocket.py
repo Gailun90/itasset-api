@@ -83,6 +83,25 @@ async def agent_websocket(
             "heartbeat_interval": HEARTBEAT_INTERVAL,
         }))
 
+        # ── 重连主动推送：连上就查一次是否有待处理任务，有则立即推送 ──
+        # 覆盖"断网重连后要等到下次轮询才能拿到任务"的场景，不用等 client 的轮询周期
+        try:
+            from sqlalchemy import select as _select
+            from app.models.models import Client as _Client, Task as _Task, TaskTarget as _TaskTarget
+            async with AsyncSessionLocal() as _db:
+                _row = (await _db.execute(
+                    _select(_Task.name)
+                    .join(_TaskTarget, _TaskTarget.task_id == _Task.id)
+                    .join(_Client, _Client.id == _TaskTarget.client_id)
+                    .where(_Client.hash_serial == serial, _TaskTarget.status == "pending")
+                    .limit(1)
+                )).first()
+            if _row:
+                await ws_manager.send(serial, {"type": "task_push", "task_name": _row[0]})
+                logger.info(f"WS重连主动推送: {serial} 有待处理任务 -> {_row[0]}")
+        except Exception:
+            logger.exception(f"WS重连检查待处理任务失败: {serial}")
+
         while True:
             try:
                 raw = await asyncio.wait_for(

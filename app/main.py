@@ -8,7 +8,9 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from app.core.database import engine, Base
 from app.core.config import get_settings
-from app.api.v1 import agent, packages, dashboard, websocket, groups
+from app.api.v1 import agent, packages, dashboard, websocket, groups, vuln, settings as settings_api
+# 漏洞修复模块的模型需要在 create_all 前注册到 Base.metadata
+from app.models import vuln as vuln_models  # noqa: F401
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +86,8 @@ app.include_router(packages.router)
 app.include_router(dashboard.router)
 app.include_router(websocket.router)
 app.include_router(groups.router)
+app.include_router(vuln.router)
+app.include_router(settings_api.router)
 
 
 @app.get("/health")

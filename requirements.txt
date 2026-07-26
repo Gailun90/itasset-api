@@ -1,0 +1,14 @@
+# itasset FastAPI 后端依赖
+# 安装：在服务器 venv 中执行  pip install -r requirements.txt
+# 注意：生产 venv 当前缺 openpyxl / httpx（漏洞解析与 LLM 调用需要），本文件已包含。
+fastapi>=0.130
+uvicorn>=0.20
+sqlalchemy>=2.0
+asyncpg>=0.29
+pydantic>=2.10
+pydantic-settings>=2.0
+slowapi>=0.1.9
+httpx>=0.27
+aiosqlite>=0.19          # 仅本地开发/测试用，生产用 asyncpg
+openpyxl>=3.1            # 漏洞 xlsx 解析（新增）
+python-multipart>=0.0.20 # 文件上传

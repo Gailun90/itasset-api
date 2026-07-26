@@ -1,0 +1,83 @@
+"""
+system_settings 读写封装 + 敏感字段（AI token）加解密
+key 命名约定：ai.openclaw_url / ai.openclaw_model / ai.openclaw_token(密文) / ai.openclaw_timeout / ai.llm_enabled
+"""
+import logging
+from typing import Optional
+from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.models import SystemSetting
+from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+def _fernet() -> Optional[Fernet]:
+    key = get_settings().SETTINGS_ENCRYPTION_KEY
+    if not key:
+        return None
+    try:
+        return Fernet(key.encode())
+    except Exception:
+        logger.error("SETTINGS_ENCRYPTION_KEY 格式无效，无法加解密敏感配置")
+        return None
+
+
+def encrypt_value(plain: str) -> str:
+    f = _fernet()
+    if not f:
+        # 没配加密key时退化为明文存储（部署时应确保 key 已生成，这里只是不让功能整体不可用）
+        return plain
+    return f.encrypt(plain.encode()).decode()
+
+
+def decrypt_value(cipher: str) -> Optional[str]:
+    if not cipher:
+        return None
+    f = _fernet()
+    if not f:
+        return cipher
+    try:
+        return f.decrypt(cipher.encode()).decode()
+    except InvalidToken:
+        # 可能是加密key换过，或者本来就是明文（历史数据）——都返回 None 而不是崩溃
+        logger.warning("解密配置字段失败（InvalidToken），可能是加密key已更换")
+        return None
+
+
+async def get_setting(db: AsyncSession, key: str) -> Optional[str]:
+    row = (await db.execute(select(SystemSetting).where(SystemSetting.key == key))).scalar_one_or_none()
+    return row.value if row else None
+
+
+async def set_setting(db: AsyncSession, key: str, value: Optional[str], updated_by: str = "") -> None:
+    row = (await db.execute(select(SystemSetting).where(SystemSetting.key == key))).scalar_one_or_none()
+    if row:
+        row.value = value
+        row.updated_by = updated_by
+    else:
+        db.add(SystemSetting(key=key, value=value, updated_by=updated_by))
+    await db.flush()
+
+
+async def get_ai_settings(db: AsyncSession) -> dict:
+    """返回解密后的完整配置（供内部逻辑使用，如 vuln_service 调 LLM），DB 没有的字段 fallback 到 config.py 默认值"""
+    cfg = get_settings()
+    url = await get_setting(db, "ai.openclaw_url")
+    model = await get_setting(db, "ai.openclaw_model")
+    token_cipher = await get_setting(db, "ai.openclaw_token")
+    timeout = await get_setting(db, "ai.openclaw_timeout")
+    llm_enabled = await get_setting(db, "ai.llm_enabled")
+    prompt = await get_setting(db, "ai.openclaw_prompt")
+
+    token = decrypt_value(token_cipher) if token_cipher else None
+
+    return {
+        "openclaw_url": url or cfg.OPENCLAW_URL,
+        "openclaw_model": model or cfg.OPENCLAW_MODEL,
+        "openclaw_token": token if token is not None else cfg.OPENCLAW_TOKEN,
+        "openclaw_timeout": int(timeout) if timeout else cfg.OPENCLAW_TIMEOUT,
+        "llm_enabled": (llm_enabled.lower() == "true") if llm_enabled is not None else cfg.VULN_LLM_ENABLED,
+        "openclaw_prompt": prompt or "",
+    }

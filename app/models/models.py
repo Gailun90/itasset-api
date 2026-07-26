@@ -95,9 +95,15 @@ class Task(Base):
 
     id:                 Mapped[int]           = mapped_column(Integer, primary_key=True, autoincrement=True)
     name:               Mapped[str]           = mapped_column(String(255), nullable=False)
-    task_type:          Mapped[str]           = mapped_column(String(32), default="install")  # install | uninstall
+    task_type:          Mapped[str]           = mapped_column(String(32), default="install")  # install | uninstall | run_command | registry | cleanup
     uninstall_target:   Mapped[Optional[str]] = mapped_column(String(512))  # 软件卸载目标名称
     package_id:         Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("packages.id", ondelete="SET NULL"))
+    # ── 命令类任务字段（run_command / registry / cleanup）──
+    command:            Mapped[Optional[str]] = mapped_column(Text)         # 下发的脚本内容（bat/cmd/powershell）
+    interpreter:        Mapped[Optional[str]] = mapped_column(String(32))   # bat | cmd | powershell（空=按内容推断）
+    registry_ops:       Mapped[Optional[list]]= mapped_column(JSONB)        # [{action,root,subkey,name,value,type}]
+    cleanup_paths:      Mapped[Optional[list]]= mapped_column(JSONB)        # [{path,recursive}]
+    run_as:             Mapped[str]           = mapped_column(String(16), default="system")  # system | user
     target_type:        Mapped[str]           = mapped_column(String(32), default="client")  # client | group | all
     target_id:          Mapped[Optional[int]] = mapped_column(Integer)
     interactive:        Mapped[bool]          = mapped_column(Boolean, default=True)
@@ -119,6 +125,8 @@ class TaskTarget(Base):
     id:           Mapped[int]           = mapped_column(Integer, primary_key=True, autoincrement=True)
     task_id:      Mapped[int]           = mapped_column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"))
     client_id:    Mapped[int]           = mapped_column(Integer, ForeignKey("clients.id", ondelete="CASCADE"))
+    # 漏洞修复联动：若本 target 由 remediation_task 下发，回报结果时回写该修复任务
+    remediation_task_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("remediation_tasks.id", ondelete="SET NULL"))
     status:       Mapped[str]           = mapped_column(String(32), default="pending")
     # pending | running | success | failed | deferred | cancelled
     message:      Mapped[Optional[str]] = mapped_column(Text)
@@ -170,3 +178,13 @@ class ActionAudit(Base):
         Index("ix_action_audit_serial", "hash_serial"),
         Index("ix_action_audit_reported_at", "reported_at"),
     )
+
+
+class SystemSetting(Base):
+    """通用键值配置表（目前用于 AI 解析设置：openclaw_url/model/token/timeout/llm_enabled）"""
+    __tablename__ = "system_settings"
+
+    key:        Mapped[str]                = mapped_column(String(100), primary_key=True)
+    value:      Mapped[Optional[str]]       = mapped_column(Text)
+    updated_at: Mapped[Optional[datetime]]  = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_by: Mapped[Optional[str]]       = mapped_column(String(100))

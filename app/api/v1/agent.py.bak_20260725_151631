@@ -124,25 +124,6 @@ async def register_client(
     return RegisterResponse(device_secret=secret, client_id=client.id)
 
 
-def _to_jsonable(v):
-    """Pydantic 模型 → dict；其它原样返回"""
-    if hasattr(v, "model_dump"):
-        return v.model_dump()
-    return v
-
-
-def _sanitize_text(obj):
-    """递归移除字符串中的控制字符（含 x00），防止 asyncpg 报 UntranslatableCharacterError。"""
-    if isinstance(obj, str):
-        # 保留可打印字符与基本空白（tab/换行/回车），其余控制字符一律剔除
-        return "".join(ch for ch in obj if ord(ch) >= 32 or ch in "\t\n\r")
-    if isinstance(obj, dict):
-        return {k: _sanitize_text(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_text(v) for v in obj]
-    return obj
-
-
 # ── POST /api/clients/report ─────────────────────────────────────────────────
 @router.post("/clients/report", response_model=ReportResponse)
 async def report_assets(
@@ -167,13 +148,11 @@ async def report_assets(
     client.disk_info = [d.model_dump() for d in body.disk_info] if body.disk_info else client.disk_info
     client.last_seen = now
 
-    sw = [_to_jsonable(s) for s in body.software] if body.software else None
-    pt = [_to_jsonable(p) for p in body.patches] if body.patches else None
     db.add(ClientReport(
         client_id=client.id,
-        current_user=_sanitize_text(body.current_user),
-        software=_sanitize_text(sw),
-        patches=_sanitize_text(pt),
+        current_user=body.current_user,
+        software=body.software,
+        patches=body.patches,
         collected_at=now,
     ))
     await db.commit()
@@ -292,12 +271,12 @@ async def get_tasks(
             timeout=task.timeout,
             success_codes=task.success_codes or [0],
             defer_count=tt.defer_count,
+            silent_override=False,
             run_as=task.run_as,
         )
 
         if task.task_type == "uninstall":
-            tasks_out.append(TaskOut(**common, max_defer_count=3, silent_override=False,
-                                      uninstall_target=task.uninstall_target))
+            tasks_out.append(TaskOut(**common, max_defer_count=3, uninstall_target=task.uninstall_target))
             continue
 
         if task.task_type in ("run_command", "registry", "cleanup"):
@@ -307,7 +286,6 @@ async def get_tasks(
             tasks_out.append(TaskOut(
                 **common,
                 max_defer_count=3,
-                silent_override=False,
                 command=task.command,
                 interpreter=task.interpreter,
                 registry_ops=reg_ops,

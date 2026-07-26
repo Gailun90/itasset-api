@@ -205,7 +205,6 @@ class AISettingsOut(BaseModel):
     openclaw_model: str
     openclaw_timeout: int
     llm_enabled: bool
-    openclaw_prompt: str = ""
     token_configured: bool
     token_last4: Optional[str] = None
 
@@ -218,7 +217,6 @@ class AISettingsIn(BaseModel):
     llm_enabled: bool = True
     openclaw_token: Optional[str] = None
     clear_token: bool = False
-    openclaw_prompt: str = ""
 
 
 class AITestResult(BaseModel):
