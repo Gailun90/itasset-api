@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -27,17 +26,9 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("数据库表初始化完成")
-    canary_task = asyncio.create_task(run_canary_scheduler())
-    try:
-        yield
-    finally:
-        canary_task.cancel()
-        try:
-            await canary_task
-        except asyncio.CancelledError:
-            pass
-        await engine.dispose()
-        logger.info("数据库连接已关闭")
+    yield
+    await engine.dispose()
+    logger.info("数据库连接已关闭")
 
 
 app = FastAPI(
@@ -48,9 +39,6 @@ app = FastAPI(
 )
 
 settings = get_settings()
-
-# 自动金丝雀后台调度器（观察窗口到点后自动放量 / 暂停规则）
-from app.services.canary_scheduler import run_canary_scheduler  # noqa: E402
 
 # 🔒 问题 23：API 速率限制（防止 DDoS 和暴力破解）
 limiter = Limiter(

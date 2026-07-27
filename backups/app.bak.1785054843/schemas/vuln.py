@@ -128,54 +128,9 @@ class RuleOut(BaseModel):
     default_risk_level: str
     status:             str
     source:             str
-    canary_status:      str = "pending"
-    canary_started_at:  Optional[datetime] = None
     notes:              Optional[str] = None
     created_at:         Optional[datetime] = None
     updated_at:         Optional[datetime] = None
 
     class Config:
         from_attributes = True
-
-
-# ── 对话式纠正（最终形态·三）──────────────────────────────────────────────────
-class CorrectionIn(BaseModel):
-    qid:              str = Field(..., min_length=1, max_length=64)
-    fix_type:         str
-    match_fields:     dict = {}
-    corrected_action: dict
-    note:             Optional[str] = None
-
-
-class CorrectionOut(BaseModel):
-    id:               int
-    qid:              str
-    fix_type:         str
-    rule_id:          Optional[int] = None
-    match_key:        str = ""
-    match_fields:     dict
-    corrected_action: dict
-    note:             Optional[str] = None
-    usage_count:      int = 0
-    created_at:       Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
-
-
-class CorrectTaskRequest(BaseModel):
-    """管理面人类对某修复任务的人工纠正（对话式规则捕获点）。"""
-    fix_type:          str
-    corrected_action:  dict
-    note:              Optional[str] = None
-    # 精确匹配键；不传则由服务端按任务风险等级 + os 派生
-    match_fields:      Optional[dict] = None
-    # 是否把该纠正沉淀为正式规则（source=manual, canary_status=pending 走金丝雀）
-    promote_to_rule:   bool = False
-    rollback_plan:     Optional[dict] = None
-    operator:          str = Field(..., min_length=1, max_length=255)
-
-
-class PromoteCorrectionRequest(BaseModel):
-    operator:       str = Field(..., min_length=1, max_length=255)
-    rollback_plan:  Optional[dict] = None

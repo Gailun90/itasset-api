@@ -31,12 +31,6 @@ from app.models.vuln import (
     VulnScanImport, VulnFinding, RemediationTask, RemediationRule,
     FIX_TYPES,
 )
-from app.core.llm_pipeline import (
-    validate_action,
-    ground_prompt_with_samples,
-    lookup_correction,
-    derive_match_fields,
-)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -229,8 +223,6 @@ async def llm_parse_finding(db, qid: str, title: str, solution: str,
             "\n\n# 企业背景与修复约束（管理员设定，必须严格遵守）\n"
             + ai_cfg["openclaw_prompt"]
         )
-    # 最终形态·四：少样本接地——把相近的真实 QID 样本拼进提示，提升产出规范度
-    system_content += ground_prompt_with_samples(qid, title)
     try:
         async with httpx.AsyncClient(timeout=ai_cfg["openclaw_timeout"]) as client:
             resp = await client.post(
@@ -479,21 +471,6 @@ async def _process_row(db: AsyncSession, imp: VulnScanImport, row: dict,
                              llm_confidence=parsed.get("confidence"))
         source_note = f"llm({parsed.get('confidence', '?')})"
 
-    # ── 最终形态·三：对话式纠正闭环 ──
-    # 命中人类纠正缓存（精确匹配 qid+fix_type+match_fields）→ 直接复用纠正后的正确动作，
-    # 覆盖 LLM/规则产出（人类纠正是最新事实；若已 promote 为正式规则则规则路径已生效）。
-    match_fields = derive_match_fields(risk)
-    corr = await lookup_correction(db, row["qid"], fix_type, match_fields)
-    if corr:
-        action = dict(corr.corrected_action or {})
-        action.setdefault("description", (row["title"] or "")[:200])
-        # 纠正后的风险按当前 fix_type 重新分级（与纠正动作保持一致）
-        risk = classify_risk(fix_type, row["title"], row["solution"])
-        source_note = (
-            f"correction:{corr.id}"
-            + (f"(rule:{corr.rule_id})" if corr.rule_id else "")
-        )
-
     action["_source"] = source_note   # 溯源信息，前端可读化展示时显示
 
     task = RemediationTask(
@@ -520,45 +497,18 @@ async def _process_row(db: AsyncSession, imp: VulnScanImport, row: dict,
 
 
 async def _save_draft_rule(db: AsyncSession, qid: str, parsed: dict, title: str):
-    """LLM 解析结果 → status=draft 规则草稿（qid 已存在则跳过）。
-
-    最终形态·四：先经 Action Validator 校验/归一化 LLM 产出——
-      - 校验失败（如生成的补丁脚本命中重启黑名单）→ 兜底 manual_review + high；
-      - EOL 类 → 强制 manual_review + high；
-      - 通过 → 采用归一化后的 action 与（可能被覆盖的）风险等级。
-    这是管线「LLM 规划 → Action 校验 → 策略引擎落库」的落库环节。
-    """
+    """LLM 解析结果 → status=draft 规则草稿（qid 已存在则跳过）"""
     exists = (await db.execute(
         select(RemediationRule.id).where(RemediationRule.qid == qid)
     )).scalar_one_or_none()
     if exists:
         return
-
-    # Action Validator（P0 安全闸门 + 结构归一化）
-    vres = validate_action(
-        parsed.get("fix_type"), parsed.get("action"),
-        qid=qid, title=title,
-        solution=(parsed.get("action") or {}).get("description", ""),
-    )
-    if not vres.ok:
-        # 校验未通过：绝不落库为可执行草稿，转人工
-        fix_type = "manual_review"
-        action = {
-            "reason": f"LLM 产出校验未通过：{vres.reason}",
-            "description": (title or "")[:200],
-        }
-        risk = "high"
-    else:
-        fix_type = vres.fix_type
-        action = vres.action
-        risk = vres.risk_override or classify_risk(
-            fix_type, title, llm_confidence=parsed.get("confidence"))
-
     db.add(RemediationRule(
         qid=qid,
-        fix_type=fix_type,
-        action_template=action,
-        default_risk_level=risk,
+        fix_type=parsed["fix_type"],
+        action_template=parsed.get("action") or {},
+        default_risk_level=classify_risk(parsed["fix_type"], title,
+                                         llm_confidence=parsed.get("confidence")),
         status="draft",
         source="llm",
         notes=f"LLM 自动生成（confidence={parsed.get('confidence', '?')}），标题：{title[:120]}",

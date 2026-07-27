@@ -26,14 +26,6 @@ class Settings(BaseSettings):
     OPENCLAW_TIMEOUT: int = 180                      # LLM 单次调用超时（秒）
     SETTINGS_ENCRYPTION_KEY: str = ""                 # system_settings 敏感字段加密key，部署时生成写入 .env
 
-    # ── 最终形态·一：mTLS（双向 TLS）──────────────────────────────────────
-    # 默认关闭：开启后，Agent 端点要求客户端证书由自建 CA 签发（HMAC 仍保留为第二因子）。
-    MTLS_ENABLED: bool = False
-    # 受信 CA 证书路径（PEM），用于校验 Agent 客户端证书
-    MTLS_CA_CERT_PATH: str = ""
-    # True=缺证书/校验失败直接 401；False=软失败（仅记录，不阻断）——灰度过渡用
-    MTLS_CLIENT_CERT_REQUIRED: bool = True
-
     class Config:
         env_file = "/opt/itasset/.env"
 

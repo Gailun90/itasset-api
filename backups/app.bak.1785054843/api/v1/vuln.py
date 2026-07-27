@@ -29,19 +29,11 @@ from app.core.vuln_engine import (
     gate_reason as _gate_reason_pure,
     build_patch_install_script,
     IRREVERSIBLE_FIX_TYPES,
-    DEFAULT_EXCLUDED_DISPATCH_ROLES,
-    build_grouping_key,
-    canary_dispatch_decision,
-    resolve_autonomy_params,
-    CANARY_DECISION_QUEUE,
-    CANARY_STATUS_PENDING,
-    CANARY_STATUS_IN_PROGRESS,
-    CANARY_STATUS_VERIFIED,
 )
 from app.models.models import Client, Task, TaskTarget, Package
 from app.models.vuln import (
     VulnScanImport, VulnFinding, RemediationTask, RemediationRule,
-    AutonomyPolicy, AutonomyRule, AssetProfile, Correction,
+    AutonomyPolicy,
     MATCH_CONFIDENCES, FIX_TYPES, RISK_LEVELS, TASK_STATUSES, RULE_STATUSES,
     AUTO_DISPATCH_FIX_TYPES,
 )
@@ -49,10 +41,6 @@ from app.schemas.vuln import (
     ImportOut, ImportStatsOut, FindingOut, ResolveMatchRequest,
     TaskListItem, TaskDetailOut, ApproveRequest, BatchApproveRequest,
     RuleIn, RuleUpdate, RuleOut,
-    CorrectionIn, CorrectionOut, CorrectTaskRequest, PromoteCorrectionRequest,
-)
-from app.core.llm_pipeline import (
-    validate_action, record_correction, derive_match_fields,
 )
 from app.services import vuln_service as vs
 from app.services.package_match import match_package
@@ -374,39 +362,16 @@ async def _find_rule(db: AsyncSession, finding: VulnFinding) -> RemediationRule 
     )).scalar_one_or_none()
 
 
-async def _load_autonomy_rules(db: AsyncSession) -> dict:
-    """加载金丝雀分级参数表为 {(fix_type, risk_level): {...}} 字典。"""
-    rows = (await db.execute(select(AutonomyRule))).scalars().all()
-    out = {}
-    for r in rows:
-        out[(r.fix_type, r.risk_level)] = {
-            "canary_batch_size": r.canary_batch_size,
-            "canary_window_minutes": r.canary_window_minutes,
-            "rollback_threshold": r.rollback_threshold,
-        }
-    return out
-
-
-async def _gate_reason(db: AsyncSession, task: RemediationTask, rule: RemediationRule | None,
-                       for_auto: bool) -> str | None:
+def _gate_reason(task: RemediationTask, rule: RemediationRule | None,
+                 for_auto: bool) -> str | None:
     """
-    下发门禁（三道闸 + 角色排除 + 回滚方案硬闸门）。返回 None 表示允许下发，否则返回阻止原因：
-      闸0·角色排除：资产角色在排除列表（域控/数据库等）时禁止自动下发，须人工确认。
+    下发门禁（三道闸 + 回滚方案硬闸门）。返回 None 表示允许下发，否则返回阻止原因：
       闸1·规则转正：规则必须存在且为 active（人工已确认）。
       闸2·高风险：for_auto=True 时 high 风险不下发，需显式「确认下发」。
       闸3·回滚方案：不可逆操作（software_uninstall / service_config）
            必须有 rollback_plan，否则禁止自动下发。
     注意：patch_install 不在不可逆列表中（补丁没有回滚概念，装了就装了）。
-
-    资产角色来自 AssetProfile（按 task.asset_id 关联）；无画像则视为普通资产（不触发排除）。
     """
-    asset_role = None
-    if task.asset_id is not None:
-        prof = (await db.execute(
-            select(AssetProfile).where(AssetProfile.client_id == task.asset_id)
-        )).scalar_one_or_none()
-        if prof:
-            asset_role = prof.role
     return _gate_reason_pure(
         fix_type=task.fix_type,
         asset_id=task.asset_id,
@@ -416,8 +381,6 @@ async def _gate_reason(db: AsyncSession, task: RemediationTask, rule: Remediatio
         rule_rollback_plan=rule.rollback_plan if rule else None,
         task_rollback_plan=task.rollback_plan if hasattr(task, 'rollback_plan') else None,
         matched_package_id=getattr(task, 'matched_package_id', None),
-        asset_role=asset_role,
-        excluded_roles=DEFAULT_EXCLUDED_DISPATCH_ROLES,
     )
 
 
@@ -547,7 +510,7 @@ async def _do_dispatch(db: AsyncSession, task: RemediationTask,
             return "全局熔断已开启（kill_switch=true），所有自动下发已暂停。需管理员在管理面手动关闭熔断后重试。"
 
     rule = await _find_rule(db, finding)
-    reason = await _gate_reason(db, task, rule, for_auto)
+    reason = _gate_reason(task, rule, for_auto)
     if reason:
         return reason
 
@@ -563,51 +526,6 @@ async def _do_dispatch(db: AsyncSession, task: RemediationTask,
     # ── 规则版本号 ──
     if rule.current_version_id:
         task.rule_version_id = rule.current_version_id
-
-    # ── 自动金丝雀：决定本次是「进入首批下发」还是「排队等放量」──
-    # verified 规则直接全量下发（canary_dispatch_decision 会返回 dispatch，但下面整段跳过）。
-    # pending / in_progress 规则：按 autonomy_rules 的批次大小控制放量节奏。
-    if rule.canary_status in (CANARY_STATUS_PENDING, CANARY_STATUS_IN_PROGRESS):
-        # ── 细粒度分组键（最终形态·二）：同一资产画像组的机器进入同一金丝雀小批量 ──
-        prof = None
-        if task.asset_id is not None:
-            prof = (await db.execute(
-                select(AssetProfile).where(AssetProfile.client_id == task.asset_id)
-            )).scalar_one_or_none()
-        group_key = build_grouping_key(
-            finding.qid, task.fix_type, task.risk_level,
-            prof.ou if prof else None,
-            prof.role if prof else None,
-            prof.maintenance_window if prof else None,
-        )
-        task.dispatch_group_key = group_key
-
-        autonomy = await _load_autonomy_rules(db)
-        params = resolve_autonomy_params(rule.fix_type, rule.default_risk_level, autonomy)
-        batch_size = params["canary_batch_size"]
-        # 统计本规则 + 同分组键 已实际下发（进入首批）的任务数（同组同批）
-        dispatched_in_batch = (await db.execute(
-            select(func.count()).where(
-                RemediationTask.rule_id == rule.id,
-                RemediationTask.dispatch_group_key == group_key,
-                RemediationTask.canary_batch.is_(True),
-                RemediationTask.status.in_(
-                    ["dispatched", "done", "failed", "pending_verify", "rollback_required"]),
-            )
-        )).scalar() or 0
-        decision = canary_dispatch_decision(rule.canary_status, dispatched_in_batch, batch_size)
-        task.rule_id = rule.id
-        if decision == CANARY_DECISION_QUEUE:
-            # 排队等放量：系统自己记着，不卡人工；观察窗口到点由 scheduler 自动放量
-            task.status = "canary_waiting"
-            await db.commit()
-            return (f"规则 #{rule.id}（QID {rule.qid}）处于金丝雀观察期，"
-                    f"本机排队等待放量（同组首批 {dispatched_in_batch}/{batch_size}，组={group_key}）")
-        # 进入首批：标记本任务为 canary 样本，并启动观察窗口
-        task.canary_batch = True
-        if rule.canary_status == CANARY_STATUS_PENDING:
-            rule.canary_status = CANARY_STATUS_IN_PROGRESS
-            rule.canary_started_at = datetime.now(timezone.utc)
 
     reason = await _dispatch_to_agent(db, task, finding, action)
     if reason:
@@ -936,193 +854,6 @@ async def delete_rule(
     await db.delete(rule)
     await db.commit()
     return {"ok": True, "message": f"规则 {rule.qid} 已删除"}
-
-
-# ── 对话式纠正（最终形态·三）──────────────────────────────────────────────────
-@router.get("/corrections", response_model=list[CorrectionOut])
-async def list_corrections(
-    qid: str = "",
-    _: bool = Depends(require_glpi_token),
-    db: AsyncSession = Depends(get_db),
-):
-    """列出对话式纠正缓存（可按 qid 过滤）。"""
-    q = select(Correction)
-    if qid:
-        q = q.where(Correction.qid == qid)
-    rows = (await db.execute(q.order_by(Correction.id.desc()))).scalars().all()
-    return [CorrectionOut.model_validate(r) for r in rows]
-
-
-@router.post("/corrections", response_model=CorrectionOut)
-async def create_correction(
-    body: CorrectionIn,
-    _: bool = Depends(require_glpi_token),
-    db: AsyncSession = Depends(get_db),
-):
-    """人工创建一条纠正（即时纠偏缓存）。纠正动作必须过 Action Validator 安全闸门。"""
-    if body.fix_type not in FIX_TYPES:
-        raise HTTPException(400, f"非法的 fix_type: {body.fix_type}")
-    vres = validate_action(body.fix_type, body.corrected_action, qid=body.qid)
-    if not vres.ok:
-        raise HTTPException(400, f"纠正动作校验未通过：{vres.reason}")
-    corr = await record_correction(
-        db, qid=body.qid, fix_type=body.fix_type,
-        match_fields=body.match_fields or derive_match_fields("medium"),
-        corrected_action=vres.action, note=body.note,
-    )
-    await db.commit()
-    await db.refresh(corr)
-    return CorrectionOut.model_validate(corr)
-
-
-@router.delete("/corrections/{corr_id}", response_model=dict)
-async def delete_correction(
-    corr_id: int,
-    _: bool = Depends(require_glpi_token),
-    db: AsyncSession = Depends(get_db),
-):
-    corr = (await db.execute(
-        select(Correction).where(Correction.id == corr_id)
-    )).scalar_one_or_none()
-    if not corr:
-        raise HTTPException(404, "纠正记录不存在")
-    await db.delete(corr)
-    await db.commit()
-    return {"ok": True, "message": f"纠正 #{corr_id} 已删除"}
-
-
-async def _promote_correction_to_rule(
-    db: AsyncSession, corr: Correction, *, operator: str,
-    rollback_plan: dict | None = None,
-) -> RemediationRule:
-    """把一条纠正沉淀为正式规则（source=manual, canary_status=pending → 走金丝雀观察）。"""
-    vres = validate_action(corr.fix_type, corr.corrected_action, qid=corr.qid)
-    action = vres.action if vres.ok else corr.corrected_action
-    risk = vres.risk_override or vs.classify_risk(corr.fix_type, "")
-    rule = (await db.execute(
-        select(RemediationRule).where(RemediationRule.qid == corr.qid)
-    )).scalar_one_or_none()
-    if rule:
-        rule.fix_type = corr.fix_type
-        rule.action_template = action
-        if rollback_plan is not None:
-            rule.rollback_plan = rollback_plan
-        rule.default_risk_level = risk
-        rule.status = "active"
-        rule.source = "manual"
-        rule.canary_status = "pending"
-        rule.notes = f"由对话式纠正 #{corr.id} 沉淀（operator={operator}）"
-    else:
-        rule = RemediationRule(
-            qid=corr.qid, fix_type=corr.fix_type, action_template=action,
-            rollback_plan=rollback_plan, default_risk_level=risk,
-            status="active", source="manual", canary_status="pending",
-            notes=f"由对话式纠正 #{corr.id} 沉淀（operator={operator}）",
-        )
-        db.add(rule)
-        await db.flush()
-    # 规则版本化
-    from app.models.vuln import RuleVersion
-    max_ver = (await db.execute(
-        select(func.coalesce(func.max(RuleVersion.version), 0))
-        .where(RuleVersion.rule_id == rule.id)
-    )).scalar_one() or 0
-    ver = RuleVersion(
-        rule_id=rule.id, version=max_ver + 1,
-        action_template=action, rollback_plan=rollback_plan,
-        fix_type=corr.fix_type, default_risk_level=risk,
-        status="active", source="manual",
-        notes=rule.notes, approved_by=operator, deprecated=False,
-    )
-    db.add(ver)
-    await db.flush()
-    rule.current_version_id = ver.id
-    corr.rule_id = rule.id
-    return rule
-
-
-@router.post("/corrections/{corr_id}/promote", response_model=RuleOut)
-async def promote_correction(
-    corr_id: int,
-    body: PromoteCorrectionRequest,
-    _: bool = Depends(require_glpi_token),
-    db: AsyncSession = Depends(get_db),
-):
-    """把一条纠正沉淀为正式规则（source=manual，经金丝雀观察后全量生效）。"""
-    corr = (await db.execute(
-        select(Correction).where(Correction.id == corr_id)
-    )).scalar_one_or_none()
-    if not corr:
-        raise HTTPException(404, "纠正记录不存在")
-    rule = await _promote_correction_to_rule(
-        db, corr, operator=body.operator, rollback_plan=body.rollback_plan)
-    await db.commit()
-    await db.refresh(rule)
-    return RuleOut.model_validate(rule)
-
-
-@router.post("/tasks/{task_id}/correct", response_model=TaskDetailOut)
-async def correct_task(
-    task_id: int,
-    body: CorrectTaskRequest,
-    _: bool = Depends(require_glpi_token),
-    db: AsyncSession = Depends(get_db),
-):
-    """捕获人类对某修复任务的人工纠正（对话式规则核心入口）。
-
-    流程：
-      1) 纠正动作先过 Action Validator（安全闸门，拒绝会触发重启/关机的纠正）；
-      2) 记录 Correction（即时纠偏缓存，后续同条件解析直接复用，不再盲信 LLM）；
-      3) 更新任务自身的 fix_type / action_json / 风险等级；
-      4) promote_to_rule=True 时把纠正沉淀为正式规则
-         （source=manual, canary_status=pending，经金丝雀观察后全量生效）。
-    """
-    if body.fix_type not in FIX_TYPES:
-        raise HTTPException(400, f"非法的 fix_type: {body.fix_type}")
-    t = (await db.execute(
-        select(RemediationTask).where(RemediationTask.id == task_id)
-    )).scalar_one_or_none()
-    if not t:
-        raise HTTPException(404, "任务不存在")
-    finding = (await db.execute(
-        select(VulnFinding).where(VulnFinding.id == t.finding_id)
-    )).scalar_one_or_none()
-    if not finding:
-        raise HTTPException(404, "关联 finding 不存在")
-
-    # 1) 安全闸门
-    vres = validate_action(
-        body.fix_type, body.corrected_action,
-        qid=finding.qid, title=finding.title or "",
-        solution=finding.solution_raw or "")
-    if not vres.ok:
-        raise HTTPException(400, f"纠正动作校验未通过：{vres.reason}")
-    corrected_action = vres.action
-
-    # 2) 记录纠正（match_fields 缺省按任务风险派生）
-    match_fields = body.match_fields or derive_match_fields(t.risk_level)
-    corr = await record_correction(
-        db, qid=finding.qid, fix_type=body.fix_type,
-        match_fields=match_fields, corrected_action=corrected_action,
-        note=body.note,
-    )
-
-    # 3) 更新任务
-    t.fix_type = body.fix_type
-    t.action_json = dict(corrected_action)
-    t.risk_level = vres.risk_override or vs.classify_risk(
-        body.fix_type, finding.title or "", finding.solution_raw or "")
-    if body.rollback_plan is not None:
-        t.rollback_plan = body.rollback_plan
-
-    # 4) 可选沉淀为规则
-    if body.promote_to_rule:
-        await _promote_correction_to_rule(
-            db, corr, operator=body.operator, rollback_plan=body.rollback_plan)
-
-    await db.commit()
-    await db.refresh(t)
-    return await task_detail(task_id, db=db)
 
 
 # ── 全局熔断开关（Kill Switch）────────────────────────────────────────────────
