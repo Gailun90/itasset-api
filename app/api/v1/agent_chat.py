@@ -25,10 +25,11 @@ from fastapi import (
     Form, Query as FastQuery,
 )
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, update, and_, or_
+from sqlalchemy import select, func, update, and_, or_, Text, String, Integer, Boolean, DateTime, Index
+from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, Base
 from app.core.deps import require_glpi_token
 from app.core.config import get_settings
 from app.core.ws_manager import ws_manager
@@ -42,6 +43,57 @@ from app.services.settings_service import get_ai_settings
 settings = get_settings()
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent-chat"])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Agent 对话审计日志模型
+# ════════════════════════════════════════════════════════════════════════════
+
+class AgentConversationLog(Base):
+    """AI Agent 对话审计日志（关联 GLPI 用户）"""
+    __tablename__ = "agent_conversation_logs"
+
+    id:            Mapped[int]           = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id:    Mapped[str]           = mapped_column(String(64), nullable=False, index=True)
+    timestamp:     Mapped[datetime]      = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    operator:      Mapped[str]           = mapped_column(String(255), nullable=False, default="unknown")
+    role:          Mapped[str]           = mapped_column(String(16), nullable=False)  # user / assistant / tool_call / tool_result / error
+    content:       Mapped[Optional[str]] = mapped_column(Text)          # 消息内容或错误信息
+    tool_name:     Mapped[Optional[str]] = mapped_column(String(64))    # 工具名称（tool_call/tool_result 时）
+    tool_args:     Mapped[Optional[str]] = mapped_column(Text)          # 工具参数 JSON
+    tool_result:   Mapped[Optional[str]] = mapped_column(Text)          # 工具执行结果 JSON
+    ip_address:    Mapped[Optional[str]] = mapped_column(String(45))    # 调用者 IP
+
+    __table_args__ = (
+        Index("ix_agent_logs_session_time", "session_id", "timestamp"),
+        Index("ix_agent_logs_operator", "operator"),
+    )
+
+
+async def _log_conversation(
+    db: AsyncSession,
+    session_id: str,
+    operator: str,
+    role: str,
+    content: str = None,
+    tool_name: str = None,
+    tool_args: dict = None,
+    tool_result: dict = None,
+    ip_address: str = None,
+):
+    """写入一条 Agent 对话审计日志"""
+    log = AgentConversationLog(
+        session_id=session_id,
+        operator=operator,
+        role=role,
+        content=content[:8000] if content else None,
+        tool_name=tool_name,
+        tool_args=json.dumps(tool_args, ensure_ascii=False, default=str)[:8000] if tool_args else None,
+        tool_result=json.dumps(tool_result, ensure_ascii=False, default=str)[:8000] if tool_result else None,
+        ip_address=ip_address,
+    )
+    db.add(log)
+    await db.commit()
 
 # ════════════════════════════════════════════════════════════════════════════
 # System Prompt — 基础模板（可被 GLPI 配置 ai.openclaw_prompt 覆盖/追加）
@@ -1233,9 +1285,18 @@ async def agent_chat(
     message = body.get("message", "").strip()
     history = body.get("history", [])
     references = body.get("references", [])
+    operator = body.get("operator", "unknown")
+    client_ip = body.get("client_ip", "")
 
     if not message:
         raise HTTPException(400, "消息不能为空")
+
+    # 生成会话 ID（同一次对话的所有消息共享一个 session_id）
+    import uuid as _uuid
+    session_id = str(_uuid.uuid4())
+
+    # 记录用户消息
+    await _log_conversation(db, session_id, operator, "user", content=message, ip_address=client_ip)
 
     # 获取 AI 配置
     ai_cfg = await get_ai_settings(db)
@@ -1312,6 +1373,10 @@ async def agent_chat(
                             "arguments": tool_args,
                         })
 
+                        # 审计日志：记录工具调用
+                        await _log_conversation(db, session_id, operator, "tool_call",
+                            tool_name=tool_name, tool_args=tool_args, ip_address=client_ip)
+
                         # 构建带 reasoning_content 的 assistant 消息（DeepSeek thinking 模式要求）
                         assistant_msg = {
                             "role": "assistant",
@@ -1340,6 +1405,9 @@ async def agent_chat(
                                     "tool_name": tool_name,
                                     "result": tool_result,
                                 })
+                                # 审计日志：记录工具执行结果
+                                await _log_conversation(db, session_id, operator, "tool_result",
+                                    tool_name=tool_name, tool_result=tool_result, ip_address=client_ip)
                                 # 把工具结果加入消息历史
                                 current_messages.append(assistant_msg)
                                 current_messages.append({
@@ -1374,6 +1442,9 @@ async def agent_chat(
                     content = msg.get("content", "")
                     if content:
                         yield _sse({"type": "content", "content": content})
+                        # 审计日志：记录 AI 回复
+                        await _log_conversation(db, session_id, operator, "assistant",
+                            content=content, ip_address=client_ip)
                     yield _sse({"type": "done"})
                     return
 
@@ -1383,6 +1454,9 @@ async def agent_chat(
 
         except Exception as e:
             logger.error(f"Agent chat stream error: {e}", exc_info=True)
+            # 审计日志：记录错误
+            await _log_conversation(db, session_id, operator, "error",
+                content=str(e), ip_address=client_ip)
             yield _sse({"type": "error", "content": f"内部错误: {str(e)}"})
 
     return StreamingResponse(
@@ -1394,6 +1468,86 @@ async def agent_chat(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Agent 对话审计日志查询：GET /api/agent/logs
+# ════════════════════════════════════════════════════════════════════════════
+
+@router.get("/logs")
+async def get_agent_logs(
+    session_id: str = FastQuery("", description="按会话 ID 过滤"),
+    operator: str = FastQuery("", description="按操作者过滤"),
+    role: str = FastQuery("", description="按角色过滤（user/assistant/tool_call/tool_result/error）"),
+    limit: int = FastQuery(100, ge=1, le=500),
+    offset: int = FastQuery(0, ge=0),
+    _: bool = Depends(require_glpi_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """查询 Agent 对话审计日志"""
+    q = select(AgentConversationLog).order_by(AgentConversationLog.timestamp.desc())
+    if session_id:
+        q = q.where(AgentConversationLog.session_id == session_id)
+    if operator:
+        q = q.where(AgentConversationLog.operator.ilike(f"%{operator}%"))
+    if role:
+        q = q.where(AgentConversationLog.role == role)
+    q = q.limit(limit).offset(offset)
+
+    rows = (await db.execute(q)).scalars().all()
+    return {
+        "logs": [
+            {
+                "id": r.id,
+                "session_id": r.session_id,
+                "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                "operator": r.operator,
+                "role": r.role,
+                "content": (r.content or "")[:500],
+                "tool_name": r.tool_name,
+                "tool_args": r.tool_args,
+                "tool_result": (r.tool_result or "")[:500] if r.tool_result else None,
+                "ip_address": r.ip_address,
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+@router.get("/logs/sessions")
+async def get_agent_sessions(
+    limit: int = FastQuery(50, ge=1, le=200),
+    _: bool = Depends(require_glpi_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取对话会话列表（按最近活动排序）"""
+    q = (
+        select(
+            AgentConversationLog.session_id,
+            AgentConversationLog.operator,
+            func.min(AgentConversationLog.timestamp).label("started_at"),
+            func.max(AgentConversationLog.timestamp).label("last_at"),
+            func.count(AgentConversationLog.id).label("msg_count"),
+        )
+        .group_by(AgentConversationLog.session_id, AgentConversationLog.operator)
+        .order_by(func.max(AgentConversationLog.timestamp).desc())
+        .limit(limit)
+    )
+    rows = (await db.execute(q)).all()
+    return {
+        "sessions": [
+            {
+                "session_id": r[0],
+                "operator": r[1],
+                "started_at": r[2].isoformat() if r[2] else None,
+                "last_at": r[3].isoformat() if r[3] else None,
+                "msg_count": r[4],
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
