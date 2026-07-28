@@ -200,7 +200,6 @@ async def remote_viewer_websocket(
     """Browser remote desktop viewer (with auth)"""
     from app.core.config import get_settings
     settings = get_settings()
-    expected = settings.GLPI_API_TOKEN or settings.AGENT_INITIAL_TOKEN
 
     # 必须先 accept() 再做业务校验，否则 Starlette 返回 403
     await websocket.accept()
