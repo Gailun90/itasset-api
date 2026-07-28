@@ -25,6 +25,8 @@ from app.core.config import get_settings
 from app.core.vuln_engine import (
     REBOOT_BLACKLIST,
     scan_reboot_blacklist,
+    SERVICE_BLACKLIST,
+    scan_service_blacklist,
     can_transition,
     gate_reason as _gate_reason_pure,
     build_patch_install_script,
@@ -50,6 +52,7 @@ from app.schemas.vuln import (
     TaskListItem, TaskDetailOut, ApproveRequest, BatchApproveRequest,
     RuleIn, RuleUpdate, RuleOut,
     CorrectionIn, CorrectionOut, CorrectTaskRequest, PromoteCorrectionRequest,
+    AICorrectRequest, AICorrectResponse,
 )
 from app.core.llm_pipeline import (
     validate_action, record_correction, derive_match_fields,
@@ -64,6 +67,8 @@ router = APIRouter(prefix="/api/vuln", tags=["vuln"])
 # 向后兼容别名（原模块内代码保持引用不变）
 _REBOOT_BLACKLIST = REBOOT_BLACKLIST
 _scan_reboot_blacklist = scan_reboot_blacklist
+_SERVICE_BLACKLIST = SERVICE_BLACKLIST
+_scan_service_blacklist = scan_service_blacklist
 _can_transition = can_transition
 _build_patch_install_script = build_patch_install_script
 
@@ -407,6 +412,10 @@ async def _gate_reason(db: AsyncSession, task: RemediationTask, rule: Remediatio
         )).scalar_one_or_none()
         if prof:
             asset_role = prof.role
+    # ── 每规则排除角色：取「全局默认 ∪ 规则级」并集，门禁按并集拦截 ──
+    excluded = set(DEFAULT_EXCLUDED_DISPATCH_ROLES)
+    if rule and getattr(rule, "excluded_roles", None):
+        excluded |= set(rule.excluded_roles)
     return _gate_reason_pure(
         fix_type=task.fix_type,
         asset_id=task.asset_id,
@@ -417,7 +426,7 @@ async def _gate_reason(db: AsyncSession, task: RemediationTask, rule: Remediatio
         task_rollback_plan=task.rollback_plan if hasattr(task, 'rollback_plan') else None,
         matched_package_id=getattr(task, 'matched_package_id', None),
         asset_role=asset_role,
-        excluded_roles=DEFAULT_EXCLUDED_DISPATCH_ROLES,
+        excluded_roles=tuple(excluded),
     )
 
 
@@ -451,21 +460,33 @@ async def _dispatch_to_agent(db: AsyncSession, task: RemediationTask,
         else:
             ops = []
             for ch in changes:
-                cp = (ch.get("path") or "").strip().strip("\\")
-                hive = (ch.get("hive") or "HKLM").strip()
-                root, subkey = _split_registry_path(f"{hive}\\{cp}" if cp else hive)
+                # 兼容两种存储形态：
+                #  - path 含 hive 前缀 / hive+path（旧单键 / 手动规则）
+                #  - root/subkey 分离（validate_action 归一化后的 LLM 规则）
+                root = ch.get("root")
+                subkey = ch.get("subkey")
                 if not subkey:
-                    return f"changes 中某项的 path 缺少子键：{ch.get('path')}"
+                    cp = (ch.get("path") or "").strip().strip("\\")
+                    hive = (ch.get("hive") or "HKLM").strip()
+                    root, subkey = _split_registry_path(f"{hive}\\{cp}" if cp else hive)
+                    if not subkey:
+                        return f"changes 中某项的 path 缺少子键：{ch.get('path')}"
                 vtype = _VTYPE_MAP.get((ch.get("type") or "REG_SZ").upper(), "string")
-                raw = ch.get("data")
+                # 数据值：归一化后用 value，UI/手动入口用 data，二者皆认
+                raw = ch.get("data") if ch.get("data") is not None else ch.get("value")
                 val = "" if raw is None else (raw if isinstance(raw, int) else str(raw))
                 act = (ch.get("action") or "set").lower()
                 ops.append({
                     "action": act, "root": root, "subkey": subkey,
-                    "name": ch.get("value") or ch.get("value_name") or "",
+                    "name": ch.get("name") or ch.get("value") or ch.get("value_name") or "",
                     "value": "" if act == "delete" else val,
                     "type": vtype,
                 })
+        # ── 安全闸门：注册表修复触碰关键服务（含自愈客户端自身）→ 拦截自动下发 ──
+        hit_svc = _scan_service_blacklist(ops)
+        if hit_svc:
+            logger.error("修复任务 #%s 注册表操作命中受保护关键服务: %s", task.id, hit_svc)
+            return f"SECURITY_BLOCKED: 注册表修复命中受保护关键服务（{hit_svc}），已转人工确认"
         requires_reboot = bool(a.get("requires_reboot", False))
         agent_task = Task(
             name=f"漏洞修复 QID {finding.qid}（注册表）",
@@ -513,6 +534,18 @@ async def _dispatch_to_agent(db: AsyncSession, task: RemediationTask,
             task_type="run_command", command=script, interpreter="powershell",
             target_type="client",
             interactive=False, need_reboot=False, timeout=1800,
+            success_codes=[0], status="active", run_as="system",
+        )
+    elif task.fix_type == "shell_exec":
+        cmd = a.get("command") or ""
+        if not cmd:
+            return "action 缺少 command"
+        timeout_sec = int(a.get("timeout", 60))
+        agent_task = Task(
+            name=f"漏洞修复 QID {finding.qid}（远程命令）",
+            task_type="run_command", command=cmd, interpreter="cmd",
+            target_type="client",
+            interactive=False, need_reboot=False, timeout=timeout_sec,
             success_codes=[0], status="active", run_as="system",
         )
     else:
@@ -639,7 +672,8 @@ async def approve_task(
 ):
     """
     批准任务。执行通道带两道闸：
-      - 规则未转正（draft/无规则）→ 停在 approved，需先去 QID 规则库转正再「确认下发」
+      - 人工 draft（未转正）/ 无规则 → 停在 approved，需先去 QID 规则库转正再「确认下发」；
+        LLM 自动生成的规则已是 active（canary_status=pending），由自动金丝雀接管下发范围，无需人工确认
       - high 风险 → 停在 approved，需显式「确认下发」（POST /tasks/{id}/dispatch）
     两道闸都过（low/medium + active 规则）才随批准自动下发（→ dispatched）。
     """
@@ -1123,6 +1157,59 @@ async def correct_task(
     await db.commit()
     await db.refresh(t)
     return await task_detail(task_id, db=db)
+
+
+@router.post("/tasks/{task_id}/ai-correct", response_model=AICorrectResponse)
+async def ai_correct_task(
+    task_id: int,
+    body: AICorrectRequest,
+    _: bool = Depends(require_glpi_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """AI 辅助对话式纠正：操作者用自然语言描述修复方式，LLM 生成结构化动作供确认（不落库）。
+
+    流程：加载任务上下文 → 拼提示调 LLM → 解析 fix_type+action → 过 Action Validator
+    → 返回建议方案。操作者在前端确认后才走 /tasks/{id}/correct 落库 + 下发。
+    """
+    t = (await db.execute(
+        select(RemediationTask).where(RemediationTask.id == task_id)
+    )).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    finding = (await db.execute(
+        select(VulnFinding).where(VulnFinding.id == t.finding_id)
+    )).scalar_one_or_none()
+    if not finding:
+        raise HTTPException(404, "关联 finding 不存在")
+
+    parsed = await vs.ai_correct_task(
+        db, qid=finding.qid or "", title=finding.title or "",
+        solution=finding.solution_raw or "",
+        results=finding.results_raw or "",
+        current_fix_type=t.fix_type,
+        current_action=t.action_json or {},
+        instruction=body.instruction,
+    )
+    fix_type = parsed.get("fix_type", "manual_review")
+    action = parsed.get("action", {})
+
+    vres = validate_action(
+        fix_type, action,
+        qid=finding.qid or "", title=finding.title or "",
+        solution=finding.solution_raw or "",
+    )
+    risk = vres.risk_override or vs.classify_risk(
+        fix_type, finding.title or "", finding.solution_raw or "")
+
+    desc = vres.action.get("description") or vres.action.get("reason") or ""
+    return AICorrectResponse(
+        fix_type=vres.fix_type,
+        action_json=vres.action,
+        action_summary=desc[:200] or None,
+        risk_level=risk,
+        validation_ok=vres.ok,
+        validation_reason=vres.reason,
+    )
 
 
 # ── 全局熔断开关（Kill Switch）────────────────────────────────────────────────

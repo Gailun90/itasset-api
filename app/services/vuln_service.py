@@ -176,7 +176,7 @@ def match_asset(index: dict, dns_name: Optional[str], ip: Optional[str]):
 LLM_SYSTEM_PROMPT = """你是企业漏洞修复专家。根据 Qualys 漏洞扫描条目的 Title 和 Solution，输出结构化修复建议。
 只输出一个 JSON 对象，不要输出任何其它文字或 markdown 代码块。JSON 格式：
 {
-  "fix_type": "registry_fix|software_upgrade|software_uninstall|patch_install|manual_review|unsupported",
+  "fix_type": "registry_fix|software_upgrade|software_uninstall|patch_install|manual_review|unsupported|shell_exec",
     "action": {
     // registry_fix: {"changes":[{"hive":"HKLM","path":"SYSTEM\\\\CurrentControlSet\\\\Services\\\\LanmanServer\\\\Parameters","value":"requiresecuritysignature","type":"REG_DWORD","data":1}], "requires_reboot": false, "description":"..."}
     //   ⚠ 重要：一个加固项若涉及多个注册表键（典型如 SMB Signing QID 90043，必须同时设置
@@ -187,6 +187,10 @@ LLM_SYSTEM_PROMPT = """你是企业漏洞修复专家。根据 Qualys 漏洞扫�
     // patch_install:     {"kb_ids": ["KB..."], "description": "..."}
     // manual_review:     {"reason": "...", "description": "..."}
     // unsupported:       {"reason": "..."}
+    // shell_exec:        {"command": "cmd /c wmic product where name=\\"XX\\" call uninstall", "description": "...", "timeout": 60}
+    //   ⚠ shell_exec 是终极手段：当标准 fix_type 无法处理时（如非标软件、特殊清理脚本、
+    //      组策略刷新等），可用 shell_exec 执行任意 Windows 命令。命令以 SYSTEM 权限运行，
+    //      禁止使用 format/shutdown/del /f /s 等危险命令。优先用标准 fix_type。
   },
   "confidence": "high|medium|low"
 }
@@ -195,6 +199,7 @@ LLM_SYSTEM_PROMPT = """你是企业漏洞修复专家。根据 Qualys 漏洞扫�
 - 软件版本过低需升级 → software_upgrade
 - EOL/停止支持的软件（如旧版 Office、旧版浏览器）→ manual_review（需业务确认）
 - 纯注册表/配置加固（如 SMB signing）→ registry_fix（若涉及多个键，必须用 changes 数组逐键列出，详见上方 schema 说明）
+- 标准卸载无法覆盖的非标软件 → shell_exec（如 wmic product where name="XX" call uninstall）
 - 无法明确判断 → manual_review，confidence 给 low"""
 
 
@@ -258,6 +263,76 @@ async def llm_parse_finding(db, qid: str, title: str, solution: str,
         return parsed
     except Exception as e:
         logger.warning("LLM 调用失败（QID=%s）：%s", qid, e)
+        return fallback
+
+
+async def ai_correct_task(db, qid: str, title: str, solution: str,
+                          results: str, current_fix_type: str,
+                          current_action: dict, instruction: str) -> dict:
+    """
+    AI 辅助对话式纠正：操作者用自然语言描述想要的修复方式，
+    LLM 据此生成结构化 fix_type + action（不落库，返回给前端确认）。
+
+    返回 {"fix_type":..., "action":{...}, "confidence":...}（格式同 llm_parse_finding）。
+    """
+    fallback = {
+        "fix_type": "manual_review",
+        "action": {"reason": "AI 纠正失败，请手动编辑", "description": instruction[:200]},
+        "confidence": "low",
+    }
+    from app.services.settings_service import get_ai_settings
+    ai_cfg = await get_ai_settings(db)
+    if not ai_cfg["llm_enabled"] or not ai_cfg["openclaw_token"]:
+        fallback["action"]["reason"] = "LLM 未启用"
+        return fallback
+
+    system_content = LLM_SYSTEM_PROMPT + (
+        "\n\n## 人工纠正指令\n"
+        "操作者对该漏洞的修复方式有具体要求。请**严格按照操作者指令**"
+        "生成 fix_type 和 action，而非自行判断。"
+        "例如操作者说「卸载 XX 软件」→ software_uninstall；"
+        "「删除注册表键 HKLM\\...\\XXX」→ registry_fix（changes 数组）。"
+    )
+    if ai_cfg.get("openclaw_prompt"):
+        system_content += "\n\n# 企业背景与修复约束\n" + ai_cfg["openclaw_prompt"]
+
+    cur_act_str = json.dumps(current_action, ensure_ascii=False) if current_action else "(无)"
+    user_prompt = (
+        f"QID: {qid}\nTitle: {title}\n"
+        f"Results(节选): {(results or '')[:800]}\n"
+        f"Solution: {(solution or '')[:1500]}\n\n"
+        f"当前 AI 生成的修复类型: {current_fix_type}\n"
+        f"当前 AI 生成的修复方案: {cur_act_str[:500]}\n\n"
+        f"## 操作者指令\n{instruction}\n\n"
+        f"请根据操作者指令生成正确的修复方案。只输出 JSON。"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=ai_cfg["openclaw_timeout"]) as client:
+            resp = await client.post(
+                f"{ai_cfg['openclaw_url'].rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {ai_cfg['openclaw_token']}"},
+                json={
+                    "model": ai_cfg["openclaw_model"],
+                    "messages": [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0,
+                    "stream": False,
+                },
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+        parsed = _extract_json(content)
+        if not parsed or parsed.get("fix_type") not in FIX_TYPES:
+            logger.warning("AI 纠正输出无法解析（QID=%s）：%.200s", qid, content)
+            fallback["action"]["reason"] = f"AI 输出无法解析：{content[:200]}"
+            return fallback
+        parsed.setdefault("action", {})
+        return parsed
+    except Exception as e:
+        logger.warning("AI 纠正调用失败（QID=%s）：%s", qid, e)
+        fallback["action"]["reason"] = f"LLM 调用失败：{e}"
         return fallback
 
 
@@ -471,8 +546,9 @@ async def _process_row(db: AsyncSession, imp: VulnScanImport, row: dict,
             parsed = await llm_parse_finding(db, row["qid"], row["title"],
                                              row["solution"], row["results"])
             llm_cache[row["qid"]] = parsed
-            # 写规则草稿（人工转正后生效；同 QID 只写一次）
-            await _save_draft_rule(db, row["qid"], parsed, row["title"])
+            # 写规则（LLM 自动生成：Validator 通过→active+canary，拆人工闸门；
+            # 拒绝兜底→draft 需人工转正；同 QID 只写一次）
+            await _save_llm_rule(db, row["qid"], parsed, row["title"])
         fix_type = parsed["fix_type"]
         action = dict(parsed.get("action") or {})
         risk = classify_risk(fix_type, row["title"], row["solution"],
@@ -519,14 +595,17 @@ async def _process_row(db: AsyncSession, imp: VulnScanImport, row: dict,
             await db.flush()
 
 
-async def _save_draft_rule(db: AsyncSession, qid: str, parsed: dict, title: str):
-    """LLM 解析结果 → status=draft 规则草稿（qid 已存在则跳过）。
+async def _save_llm_rule(db: AsyncSession, qid: str, parsed: dict, title: str):
+    """LLM 解析结果 → 落库为 RemediationRule（最终形态·四）。
 
-    最终形态·四：先经 Action Validator 校验/归一化 LLM 产出——
-      - 校验失败（如生成的补丁脚本命中重启黑名单）→ 兜底 manual_review + high；
-      - EOL 类 → 强制 manual_review + high；
-      - 通过 → 采用归一化后的 action 与（可能被覆盖的）风险等级。
-    这是管线「LLM 规划 → Action 校验 → 策略引擎落库」的落库环节。
+    关键决策（文档核心）：LLM/自动生成的规则**不再落 draft 等人工转正**，
+    而是直接 `status=active` + `canary_status=pending`，由五节自动金丝雀机制
+    控制实际下发范围（小批量先发 → 观察 → 自动放量/暂停），全程无需人工确认。
+
+    本函数作用在 Action Validator 之后，据其结果定状态：
+      - 校验通过（vres.ok）→ active + canary（走自动金丝雀，拆人工闸门）；
+      - 校验失败 / 兜底 manual_review → 仍落 draft（4.2.1 兜底，需人工看一眼再转正）。
+    qid 已存在规则则跳过（同一 QID 只生成一次）。
     """
     exists = (await db.execute(
         select(RemediationRule.id).where(RemediationRule.qid == qid)
@@ -559,7 +638,9 @@ async def _save_draft_rule(db: AsyncSession, qid: str, parsed: dict, title: str)
         fix_type=fix_type,
         action_template=action,
         default_risk_level=risk,
-        status="draft",
+        # 校验通过 → active + canary（拆人工闸门）；校验失败 → draft（人工兜底）
+        status="active" if vres.ok else "draft",
+        canary_status="pending",
         source="llm",
         notes=f"LLM 自动生成（confidence={parsed.get('confidence', '?')}），标题：{title[:120]}",
     ))

@@ -531,17 +531,36 @@ def _verify_registry_fix(rt: "RemediationTask", body: TaskResultRequest) -> bool
     def _norm(root: str, subkey: str, name: str) -> str:
         return f"{root}\\{subkey}\\{name}".upper().replace("\\", "")
 
+    def _split_registry_path(path: str) -> tuple[str, str]:
+        """'HKLM\\SOFTWARE\\X' / 'HKEY_LOCAL_MACHINE\\SOFTWARE\\X' → ('HKLM', 'SOFTWARE\\X')"""
+        p = (path or "").strip().strip("\\")
+        root, _, sub = p.partition("\\")
+        root_map = {
+            "HKLM": "HKLM", "HKEY_LOCAL_MACHINE": "HKLM",
+            "HKCU": "HKCU", "HKEY_CURRENT_USER": "HKCU",
+        }
+        return root_map.get(root.upper(), "HKLM"), sub
+
     # 期望表：norm_key → (action, expected_data_str)
+    # 兼容两种存储形态：
+    #  - root/subkey 分离（validate_action 归一化后的 LLM 规则 / 下发快照）
+    #  - hive+path（旧单键 / 手动规则）
     expected: dict = {}
     for ch in changes:
-        hive = (ch.get("hive") or "HKLM").strip()
-        cp = (ch.get("path") or "").strip().strip("\\")
-        name = ch.get("value") or ch.get("value_name") or ""
-        root = "HKCU" if hive.upper() == "HKCU" else "HKLM"
-        key = _norm(root, cp, name)
+        root = ch.get("root")
+        subkey = ch.get("subkey")
+        if not subkey:
+            hive = (ch.get("hive") or "HKLM").strip()
+            cp = (ch.get("path") or "").strip().strip("\\")
+            root, subkey = _split_registry_path(f"{hive}\\{cp}" if cp else hive)
+            if not subkey:
+                continue
+        root = "HKCU" if (root or "HKLM").upper() == "HKCU" else "HKLM"
+        name = ch.get("name") or ch.get("value") or ch.get("value_name") or ""
+        key = _norm(root, subkey, name)
         act = (ch.get("action") or "set").lower()
-        data = ch.get("data")
-        expected[key] = (act, "" if data is None else str(data))
+        raw = ch.get("value") if ch.get("value") is not None else ch.get("data")
+        expected[key] = (act, "" if raw is None else str(raw))
 
     # 支持多 ops 格式（Agent 新格式：{ ops: [{before, after}, ...] }）
     snaps = vs.get("ops") if isinstance(vs, dict) else None

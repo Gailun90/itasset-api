@@ -33,7 +33,7 @@ JsonVariant = JSON().with_variant(JSONB(), "postgresql")
 IMPORT_STATUSES   = ("pending", "parsing", "completed", "failed")
 MATCH_CONFIDENCES = ("exact_hostname", "exact_ip", "fuzzy", "unmatched")
 FIX_TYPES         = ("registry_fix", "software_upgrade", "software_uninstall",
-                     "patch_install", "manual_review", "unsupported")
+                     "patch_install", "manual_review", "unsupported", "shell_exec")
 RISK_LEVELS       = ("low", "medium", "high")
 TASK_STATUSES     = ("pending", "approved", "rejected", "needs_manual",
                      "dispatched", "done", "failed",
@@ -96,9 +96,9 @@ class RemediationTask(Base):
     action_json:     Mapped[Optional[dict]]= mapped_column(JsonVariant)
     risk_level:      Mapped[str]           = mapped_column(String(8), default="medium")   # low | medium | high
     auto_approve:    Mapped[bool]          = mapped_column(Boolean, default=False)         # 低风险默认勾选（仅 UI 预选，不自动执行）
-    status:          Mapped[str]           = mapped_column(String(16), default="pending")
+    status:          Mapped[str]           = mapped_column(String(32), default="pending")
     # pending | approved | rejected | needs_manual | dispatched | done | failed
-    # 新增中间态：pending_verify（等待后校验）| rollback_required（需回滚）| canary_waiting（金丝雀排队等放量）
+    # 新增中间态：pending_verify（等待后校验）| rollback_required（需回滚，17 字符，故列宽须 ≥32）| canary_waiting（金丝雀排队等放量）
     approved_by:     Mapped[Optional[str]] = mapped_column(String(255))
     approved_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     result_log:      Mapped[Optional[str]] = mapped_column(Text)          # 第二阶段执行通道回写
@@ -155,6 +155,10 @@ class RemediationRule(Base):
     notes:              Mapped[Optional[str]] = mapped_column(Text)
     # ── 回滚方案 ──
     rollback_plan:      Mapped[Optional[dict]]= mapped_column(JsonVariant)
+    # ── 每规则自动下发排除角色（最终形态·二细化）：
+    #    在全局 DEFAULT_EXCLUDED_DISPATCH_ROLES 之外，规则可追加自身禁发的角色。
+    #    下发门禁取「全局 ∪ 规则级」的并集。NULL = 不追加（仅用全局默认）。
+    excluded_roles:     Mapped[Optional[list]] = mapped_column(JsonVariant, nullable=True)
     # ── 规则版本化 ──
     # current_version_id 指向 rule_versions 表中的当前生效版本
     current_version_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

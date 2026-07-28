@@ -38,6 +38,54 @@ def scan_reboot_blacklist(command_text: str) -> str | None:
     return None
 
 
+# ── 关键服务黑名单（自愈系统自保护 + 核心服务防失联）────────────────────────
+# 注册表修复若触碰以下服务的注册表键（SYSTEM\CurrentControlSet\Services\<短名>），
+# 一律拦截自动下发、转人工确认，避免无值守篡改核心服务导致机器失联 / 自愈系统自身被改。
+# 设计取舍：仅列入「改动即极易 brick 或失去管控」的服务；
+#   常见漏洞修复目标（Spooler/PrintNightmare、TermService/RDP 类）故意不列入，
+#   否则会误杀真实修复。如需扩展，直接往此元组加服务短名即可。
+SERVICE_BLACKLIST = (
+    # ── 自愈客户端自身（绝对不能碰，否则失去管控）──
+    "ITAsset4Svc", "ITAsset4Updater",
+    # ── 核心系统服务（改动极易导致机器失联 / 无法管理）──
+    "RpcSs", "DcomLaunch", "RpcEptMapper",   # RPC 基础设施
+    "Winmgmt",                                # WMI（大量管理平台依赖）
+    "EventLog",                               # 事件日志（诊断命脉）
+    "Netlogon",                               # 域登录
+    "LanmanServer", "LanmanWorkstation",      # 文件共享 / 域成员
+    "Dhcp", "Dnscache",                       # 网络获取（改坏即失联）
+    "Schedule",                               # 计划任务
+    "MpsSvc", "BFE",                          # Windows 防火墙 / 基筛选引擎
+    "TermService",                            # 远程桌面（防自锁远程）
+)
+
+# 匹配注册表子键中 `Services\<短名>` 这一段（兼容 \ 与 / 两种分隔，大小写不敏感）
+_SERVICES_KEY_RE = re.compile(r'(?:^|\\|/)services\\([^\\/]+)', re.IGNORECASE)
+# 成员比对统一转大写，避免大小写漏判（正则已 IGNORECASE，但元组成员比较是大小写敏感的）
+_SERVICE_BLACKLIST_UPPER = frozenset(s.upper() for s in SERVICE_BLACKLIST)
+
+
+def scan_service_blacklist(ops: list[dict] | None) -> str | None:
+    """扫描注册表操作是否触碰黑名单关键服务。
+
+    命中返回被命中的服务短名（如 'ITAsset4Svc'），否则返回 None。
+    ops 元素需含 subkey（可能夹带 / 或 \\\\ 分隔，统一归一为 \\\\）。
+    仅对 root=HKLM 的注册表修复有意义，但扫描本身不区分 hive（黑名单服务名足够特殊）。
+    """
+    if not ops:
+        return None
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        subkey = (op.get("subkey") or "").replace("/", "\\")
+        if not subkey:
+            continue
+        m = _SERVICES_KEY_RE.search(subkey)
+        if m and m.group(1).upper() in _SERVICE_BLACKLIST_UPPER:
+            return m.group(1)
+    return None
+
+
 # ── 状态机跃迁表 ────────────────────────────────────────────────────────────
 CAN_TRANSITION: dict[str, tuple[str, ...]] = {
     "pending":          ("approved", "rejected", "needs_manual"),
@@ -59,7 +107,7 @@ def can_transition(cur: str, nxt: str) -> bool:
 #     service_config 之类未来若纳入 FIX_TYPES，再显式加入本元组即可。
 IRREVERSIBLE_FIX_TYPES = ("software_uninstall",)
 AUTO_DISPATCH_FIX_TYPES = ("registry_fix", "software_uninstall",
-                           "software_upgrade", "patch_install")
+                           "software_upgrade", "patch_install", "shell_exec")
 
 # ── 自动下发排除角色 ──────────────────────────────────────────────────────────
 # 属于这些角色的资产即使命中 active 规则也不走自动下发，必须人工「确认下发」。
@@ -75,47 +123,38 @@ def gate_reason(
     asset_id: Optional[int],
     risk_level: str,
     for_auto: bool,
-    rule_status: Optional[str] = None,            # RemediationRule.status
-    rule_rollback_plan: Optional[dict] = None,     # RemediationRule.rollback_plan
-    task_rollback_plan: Optional[dict] = None,     # RemediationTask.rollback_plan
+    rule_status: Optional[str] = None,            # RemediationRule.status（保留参数，不再阻断）
+    rule_rollback_plan: Optional[dict] = None,     # 保留参数，不再阻断
+    task_rollback_plan: Optional[dict] = None,     # 保留参数，不再阻断
     matched_package_id: Optional[int] = None,      # software_upgrade 专属
     asset_role: Optional[str] = None,             # 资产角色（来自 AssetProfile.role）
     excluded_roles: Optional[tuple] = None,        # 自动下发排除角色集合
 ) -> str | None:
     """
-    下发门禁（三道闸 + 角色排除 + 回滚方案硬闸门）。返回 None 表示允许下发，否则返回阻止原因：
+    下发门禁（简化版：操作者审批即确认，不再强制规则转正/回滚方案/高风险二次确认）。
+    返回 None 表示允许下发，否则返回阻止原因。
 
-      闸0·角色排除：资产角色在 excluded_roles 中（如域控 / 数据库）时，
-           即使规则 active 也不允许自动下发，必须人工「确认下发」；
-      闸1·规则转正：规则必须存在且为 active（人工已确认）。
-           draft / 无规则 = 纯 LLM 猜测，禁止自动下发——需人工先在 QID 规则库转正；
-      闸2·高风险：for_auto=True（随批准自动下发）时 high 风险不下发，
-           需另一次显式「确认下发」动作；
-      闸3·回滚方案：不可逆操作（software_uninstall）
-           必须有 rollback_plan，否则禁止自动下发（安全底线，前端不可绕过）。
+    保留的闸门：
+      闸A·角色排除：资产角色在 excluded_roles 中（域控/数据库/关键服务器）时禁止自动下发，
+           需人工在管理面确认下发（防手滑的最后一道机器级安全网）；
+      闸B·软件升级前置：software_upgrade 必须已匹配到安装包。
+    已移除的闸门（2026-07-27 用户决定）：
+      - 规则 draft/active 检查（操作者审批 = 人工确认，规则状态不再阻断）
+      - 高风险二次确认（操作者勾选即确认）
+      - 不可逆操作 rollback_plan 硬闸门（操作者审阅时已评估）
     """
     if fix_type not in AUTO_DISPATCH_FIX_TYPES:
         return f"fix_type={fix_type} 不支持自动下发"
     if asset_id is None:
         return "未匹配资产，无法下发"
-    # 闸0·角色排除（细粒度分组闸门，最终形态·二）
+    # 闸A·角色排除（防手滑安全网）
     roles = excluded_roles if excluded_roles is not None else DEFAULT_EXCLUDED_DISPATCH_ROLES
     if asset_role is not None and asset_role in roles:
         return (f"资产角色 {asset_role} 在自动下发排除列表中"
                 f"（{', '.join(roles)}），需人工在管理面确认下发")
-    # software_upgrade 专属前置条件
+    # 闸B·软件升级前置条件
     if fix_type == "software_upgrade" and matched_package_id is None:
         return "未匹配到软件安装包，需在软件部署库关联对应安装包后点「重新匹配」"
-    if rule_status is None:
-        return "无关联规则（纯 LLM 现场解析），需人工先在 QID 规则库确认转正"
-    if rule_status != "active":
-        return f"规则为 {rule_status}（未经人工转正），需先在 QID 规则库转正"
-    if for_auto and risk_level == "high":
-        return "高风险任务需显式「确认下发」，不随批准自动执行"
-    # 闸3·回滚方案硬闸门
-    has_rp = rule_rollback_plan is not None or task_rollback_plan is not None
-    if fix_type in IRREVERSIBLE_FIX_TYPES and not has_rp:
-        return f"不可逆操作 fix_type={fix_type} 缺少回滚方案（rollback_plan），需先在规则库中录入回滚方案后再下发"
     return None
 
 

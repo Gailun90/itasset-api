@@ -10,6 +10,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.database import engine, Base
 from app.core.config import get_settings
 from app.api.v1 import agent, packages, dashboard, websocket, groups, vuln, settings as settings_api
+from app.api.v1 import agent_chat
 # 漏洞修复模块的模型需要在 create_all 前注册到 Base.metadata
 from app.models import vuln as vuln_models  # noqa: F401
 
@@ -28,12 +29,20 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     logger.info("数据库表初始化完成")
     canary_task = asyncio.create_task(run_canary_scheduler())
+    # Agent 对话引擎定时调度器（每 10 分钟扫描 + 下发）
+    from app.api.v1.agent_chat import run_agent_scheduler
+    agent_sched_task = asyncio.create_task(run_agent_scheduler())
     try:
         yield
     finally:
         canary_task.cancel()
         try:
             await canary_task
+        except asyncio.CancelledError:
+            pass
+        agent_sched_task.cancel()
+        try:
+            await agent_sched_task
         except asyncio.CancelledError:
             pass
         await engine.dispose()
@@ -100,6 +109,7 @@ app.include_router(websocket.router)
 app.include_router(groups.router)
 app.include_router(vuln.router)
 app.include_router(settings_api.router)
+app.include_router(agent_chat.router)
 
 
 @app.get("/health")

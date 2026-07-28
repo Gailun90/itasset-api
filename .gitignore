@@ -13,3 +13,9 @@ packages/
 # 备份目录
 app_backup_*/
 *.bak
+
+# 运行时敏感数据/证书/临时目录，不入库
+tls/
+backups/
+workspace/
+tmp/

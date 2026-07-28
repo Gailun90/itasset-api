@@ -71,10 +71,23 @@ def _split_registry_path(path: str) -> tuple[str, str]:
 def _norm_registry_op(ch: dict) -> dict:
     """归一化单个 registry 变更项为客户端可消费的 ops 结构。
 
-    兼容两种输入：
-      - changes 数组格式：path 不含 hive，由显式 hive 字段拼接（HKLM\\...）；
-      - 旧单键格式：registry_path 已含 hive 前缀（HKLM\\SOFTWARE\\X），直接拆分。
+    兼容三种输入：
+      - path 含 hive 前缀（旧单键格式）：HKLM\\SOFTWARE\\X；
+      - hive + path 分离（手动/UI 入口）；
+      - root/subkey 分离（已被本函数归一化过的存储形态，避免二次解析丢子键）。
     """
+    # 已是归一化形态（root/subkey 分离）→ 直接复用，不重复解析
+    if ch.get("subkey"):
+        act = (ch.get("action") or "set").lower()
+        raw = ch.get("data") if ch.get("data") is not None else ch.get("value")
+        return {
+            "action": act,
+            "root": (ch.get("root") or "HKLM").upper(),
+            "subkey": ch["subkey"].strip().strip("\\"),
+            "name": ch.get("value") or ch.get("value_name") or "",
+            "value": "" if act == "delete" else ("" if raw is None else (raw if isinstance(raw, int) else str(raw))),
+            "type": _VTYPE_MAP.get((ch.get("type") or "REG_SZ").upper(), "string"),
+        }
     cp = (ch.get("path") or "").strip().strip("\\")
     if cp.upper().startswith(("HKLM", "HKCU", "HKEY")):
         # path 已含 hive 前缀（旧单键格式）
@@ -194,6 +207,24 @@ def validate_action(
     if fix_type in ("manual_review", "unsupported"):
         action.setdefault("reason", (title or "")[:200])
         return ActionValidationResult(True, None, fix_type, action)
+
+    if fix_type == "shell_exec":
+        cmd = (action.get("command") or "").strip()
+        if not cmd:
+            return ActionValidationResult(
+                False, "shell_exec 缺少 command 字段", fix_type, action)
+        cmd_lower = cmd.lower()
+        for danger in ("format ", "shutdown", "del /f /s", "del /s /q",
+                        "rd /s", "rmdir /s", "diskpart", "reg delete",
+                        "bcdedit", "takeown /f", "cipher /w"):
+            if danger in cmd_lower:
+                return ActionValidationResult(
+                    False, f"SECURITY_BLOCKED: shell_exec 命令命中危险关键词: {danger}",
+                    fix_type, action)
+        action.setdefault("timeout", 60)
+        action.setdefault("description", cmd[:200])
+        risk = "high"
+        return ActionValidationResult(True, None, fix_type, action, risk_override=risk)
 
     # 兜底（理论上不会到这，因为前面已校验 fix_type ∈ FIX_TYPES）
     return ActionValidationResult(True, None, fix_type, action)

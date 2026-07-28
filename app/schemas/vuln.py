@@ -179,3 +179,21 @@ class CorrectTaskRequest(BaseModel):
 class PromoteCorrectionRequest(BaseModel):
     operator:       str = Field(..., min_length=1, max_length=255)
     rollback_plan:  Optional[dict] = None
+
+
+# ── AI 辅助纠正（对话式）──────────────────────────────────────────────────────
+class AICorrectRequest(BaseModel):
+    """操作者用自然语言描述想要的修复方式，AI 生成结构化动作供确认。"""
+    instruction: str = Field(..., min_length=2, max_length=2000)
+    operator:    str = Field(..., min_length=1, max_length=255)
+
+
+class AICorrectResponse(BaseModel):
+    """AI 生成的建议修复方案（未提交，需操作者确认后才走 correct_task 落库）。"""
+    fix_type:          str
+    action_json:       Optional[dict] = None
+    action_summary:    Optional[str] = None
+    risk_level:        str = "medium"
+    validation_ok:     bool = True
+    validation_reason: Optional[str] = None
+    llm_raw:           Optional[str] = None
