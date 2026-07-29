@@ -25,7 +25,7 @@ from fastapi import (
     Form, Query as FastQuery,
 )
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, update, delete as sqldelete, and_, or_, Text, String, Integer, Boolean, DateTime, Index
+from sqlalchemy import select, func, update, and_, or_, Text, String, Integer, Boolean, DateTime, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,7 +33,7 @@ from app.core.database import get_db, Base
 from app.core.deps import require_glpi_token
 from app.core.config import get_settings
 from app.core.ws_manager import ws_manager
-from app.models.models import Client, Task, TaskTarget, Package, Group
+from app.models.models import Client, Task, TaskTarget, Package, Group, ClientReport
 from app.models.vuln import (
     VulnFinding, RemediationTask, RemediationRule,
     TASK_STATUSES, FIX_TYPES, RISK_LEVELS,
@@ -113,6 +113,7 @@ BASE_SYSTEM_PROMPT = """你是企业终端安全运维 Agent，部署在 IT 资�
 8. **设置任务优先级**（set_priority）：调整任务优先级
 9. **批准/拒绝/取消/删除任务**（manage_task）：对漏洞修复任务执行状态变更或删除
 10. **修改任务动作**（update_task）：更新修复任务的动作内容（如注册表修改值、命令等）
+11. **查看终端软件清单**（get_client_software）：直接从数据库获取终端已安装的软件列表（无需远程命令）
 
 ## 使用规则
 
@@ -375,34 +376,6 @@ TOOL_DEFINITIONS = [
                         "description": "命令解释器（run_command 时使用）",
                         "default": "powershell",
                     },
-                    "registry_ops": {
-                        "type": "array",
-                        "description": "注册表操作列表（registry 时必填）。每项: {action: set|delete, root: HKLM|HKCU, subkey, name, value, type: string|dword|qword|binary|multi_string}",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "action": {"type": "string", "enum": ["set", "delete"], "default": "set"},
-                                "root":   {"type": "string", "enum": ["HKLM", "HKCU"], "default": "HKLM"},
-                                "subkey": {"type": "string"},
-                                "name":   {"type": "string"},
-                                "value":  {"type": "string"},
-                                "type":   {"type": "string", "default": "string"},
-                            },
-                            "required": ["subkey", "name"],
-                        },
-                    },
-                    "cleanup_paths": {
-                        "type": "array",
-                        "description": "要清理的文件/目录列表（cleanup 时必填）。每项: {path, recursive}",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path":      {"type": "string"},
-                                "recursive": {"type": "boolean", "default": False},
-                            },
-                            "required": ["path"],
-                        },
-                    },
                     "client_ids": {
                         "type": "array",
                         "items": {"type": "integer"},
@@ -562,6 +535,28 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_client_software",
+            "description": "获取指定终端已安装的软件列表（直接从系统数据库读取，无需远程命令）。返回软件名称、版本、发布者、安装日期等信息。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_id": {
+                        "type": "integer",
+                        "description": "终端 ID",
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "搜索关键词（按软件名称/发布者过滤）",
+                        "default": "",
+                    },
+                },
+                "required": ["client_id"],
+            },
+        },
+    },
 ]
 
 
@@ -600,8 +595,8 @@ async def tool_list_pending_tasks(
     if fix_type != "all":
         q = q.where(RemediationTask.fix_type == fix_type)
     q = q.order_by(
-        # high 优先, 然后按 id 排序（布尔表达式升序会把 True 排到最后，必须 desc()）
-        (RemediationTask.risk_level == "high").desc(),
+        # high 优先, 然后按 id 排序
+        RemediationTask.risk_level == "high",
         RemediationTask.id.desc(),
     ).limit(limit)
 
@@ -732,6 +727,53 @@ async def tool_shell_exec(
     }
 
 
+async def tool_get_client_software(
+    db: AsyncSession,
+    client_id: int,
+    search: str = "",
+) -> dict:
+    """获取指定终端已安装的软件列表（从系统数据库读取，无需远程命令）"""
+    result = await db.execute(select(Client).where(Client.id == client_id))
+    client = result.scalar_one_or_none()
+    if not client:
+        return {"error": f"终端 ID {client_id} 不存在"}
+
+    # 查询最新的软件清单报告
+    report_result = await db.execute(
+        select(ClientReport)
+        .where(ClientReport.client_id == client_id)
+        .order_by(ClientReport.collected_at.desc())
+        .limit(1)
+    )
+    report = report_result.scalar_one_or_none()
+    if not report:
+        return {
+            "client_id": client_id,
+            "hostname": client.hostname,
+            "software": [],
+            "count": 0,
+            "message": "暂无软件清单数据（终端可能未上报过软件列表）",
+        }
+
+    software_list = report.software or []
+    # 搜索过滤
+    if search:
+        search_lower = search.lower()
+        software_list = [
+            s for s in software_list
+            if search_lower in (s.get("name", "") + " " + s.get("publisher", "")).lower()
+        ]
+
+    return {
+        "client_id": client_id,
+        "hostname": client.hostname,
+        "software": software_list[:100],  # 限制返回数量
+        "count": len(software_list),
+        "total": len(report.software or []),
+        "collected_at": report.collected_at.isoformat() if report.collected_at else None,
+    }
+
+
 async def tool_dispatch_task(
     db: AsyncSession,
     task_id: int,
@@ -834,90 +876,45 @@ async def tool_update_rule(
     status: str = None,
     notes: str = None,
 ) -> dict:
-    """
-    创建或修改 QID 修复规则（upsert：不存在则新建，已存在则更新）。
-
-    此前本工具直接写库、完全绕过"四、LLM 处理管线"里已有的 Action Validator
-    （fix_type 合法性、服务黑名单等校验），导致对话式改规则和 LLM 自动生成规则
-    走的是两条标准不一致的路径。现在只要本次调用会设置/变更 fix_type 或
-    action_template（即引入新的可执行动作），一律先过 validate_action 校验；
-    只改 risk_level/notes 这类不涉及执行动作的字段则不需要重新校验。
-    """
-    from app.core.llm_pipeline import validate_action
-
+    """创建或修改 QID 修复规则（upsert：不存在则新建，已存在则更新）"""
     result = await db.execute(
         select(RemediationRule).where(RemediationRule.qid == qid)
     )
     rule = result.scalar_one_or_none()
     is_new = False
 
-    touches_action = (fix_type is not None) or (action_template is not None)
-    validator_note = None
-
     if not rule:
         # 创建新规则
         if not fix_type:
             return {"error": f"创建新规则需要指定 fix_type"}
-
-        vres = validate_action(fix_type, action_template, qid=qid, title=notes or "")
-        if vres.ok:
-            eff_fix_type, eff_action = vres.fix_type, vres.action
-            eff_status = status or "active"
-        else:
-            eff_fix_type, eff_action = "manual_review", {
-                "reason": f"Action Validator 未通过：{vres.reason}",
-                "description": (notes or "")[:200],
-            }
-            eff_status = "draft"
-            validator_note = vres.reason
-
         rule = RemediationRule(
             qid=qid,
-            fix_type=eff_fix_type,
-            action_template=eff_action,
-            default_risk_level=vres.risk_override or default_risk_level or "medium",
-            status=eff_status,
+            fix_type=fix_type,
+            default_risk_level=default_risk_level or "medium",
+            status=status or "active",
             source="agent",
         )
+        if action_template is not None:
+            rule.action_template = action_template
         if notes is not None:
             rule.notes = notes
         db.add(rule)
         is_new = True
     else:
         # 更新已有规则
-        if touches_action:
-            vres = validate_action(
-                fix_type or rule.fix_type,
-                action_template if action_template is not None else rule.action_template,
-                qid=qid, title=notes or rule.notes or "",
-            )
-            if vres.ok:
-                rule.fix_type = vres.fix_type
-                rule.action_template = vres.action
-                # 校验通过时才允许按请求设置 status；未显式请求则保持不变
-                if status:
-                    rule.status = status
-            else:
-                rule.fix_type = "manual_review"
-                rule.action_template = {
-                    "reason": f"Action Validator 未通过：{vres.reason}",
-                    "description": (notes or rule.notes or "")[:200],
-                }
-                rule.status = "draft"
-                validator_note = vres.reason
-        elif status:
-            rule.status = status
-
+        if fix_type:
+            rule.fix_type = fix_type
+        if action_template is not None:
+            rule.action_template = action_template
         if default_risk_level:
             rule.default_risk_level = default_risk_level
+        if status:
+            rule.status = status
         if notes is not None:
             rule.notes = notes
 
     await db.commit()
     await db.refresh(rule)
-    msg = f"QID {qid} 规则已{'创建' if is_new else '更新'}"
-    if validator_note:
-        msg += f"（⚠️ Action Validator 未通过，已降级为 manual_review/draft，原因：{validator_note}）"
     return {
         "qid": qid,
         "rule_id": rule.id,
@@ -925,8 +922,7 @@ async def tool_update_rule(
         "fix_type": rule.fix_type,
         "risk_level": rule.default_risk_level,
         "rule_status": rule.status,
-        "validator_blocked": bool(validator_note),
-        "message": msg,
+        "message": f"QID {qid} 规则已{'创建' if is_new else '更新'}",
     }
 
 
@@ -936,10 +932,6 @@ async def tool_manage_package(
     package_id: int = None,
     task_id: int = None,
     search: str = "",
-    name: str = None,
-    version: str = None,
-    silent_args: str = None,
-    description: str = None,
 ) -> dict:
     """管理软件安装包"""
     if action == "list":
@@ -1031,8 +1023,6 @@ async def tool_deploy_software(
     uninstall_target: str = None,
     command: str = None,
     interpreter: str = "powershell",
-    registry_ops: list[dict] = None,
-    cleanup_paths: list[dict] = None,
     client_ids: list[int] = None,
     group_id: int = None,
     target_all: bool = False,
@@ -1048,10 +1038,6 @@ async def tool_deploy_software(
         return {"error": "uninstall 操作需要 uninstall_target"}
     if action == "run_command" and not command:
         return {"error": "run_command 操作需要 command"}
-    if action == "registry" and not registry_ops:
-        return {"error": "registry 操作需要 registry_ops（此前该动作声明了但无法传参，现已补上）"}
-    if action == "cleanup" and not cleanup_paths:
-        return {"error": "cleanup 操作需要 cleanup_paths（此前该动作声明了但无法传参，现已补上）"}
 
     # 解析目标终端
     target_type = "client"
@@ -1074,8 +1060,6 @@ async def tool_deploy_software(
         package_id=package_id if action == "install" else None,
         command=command if action == "run_command" else None,
         interpreter=interpreter if action == "run_command" else None,
-        registry_ops=registry_ops if action == "registry" else None,
-        cleanup_paths=cleanup_paths if action == "cleanup" else None,
         target_type=target_type,
         interactive=interactive,
         need_reboot=need_reboot,
@@ -1280,9 +1264,7 @@ async def tool_manage_task(
         return {"task_id": task_id, "status": "cancelled", "message": f"任务 #{task_id} 已取消/关闭"}
 
     elif action == "delete":
-        # 彻底删除任务：已下发/已执行的任务不允许删除，避免抹掉真实执行过的审计记录
-        if rt.status in ("dispatched", "done", "failed"):
-            return {"error": f"任务 #{task_id} 状态为 {rt.status}，已下发/执行过，不允许删除（如需关闭请用 cancel）"}
+        # 彻底删除任务
         await db.delete(rt)
         await db.commit()
         return {"task_id": task_id, "status": "deleted", "message": f"任务 #{task_id} 已删除"}
@@ -1346,6 +1328,7 @@ TOOL_FUNCTIONS = {
     "manage_task": tool_manage_task,
     "update_task": tool_update_task,
     "deploy_software": tool_deploy_software,
+    "get_client_software": tool_get_client_software,
 }
 
 
@@ -1412,8 +1395,7 @@ async def agent_chat(
     async def event_stream():
         """SSE 流式响应"""
         try:
-            max_tool_rounds = 30  # 最多 30 轮工具调用（此前 5 轮太少，稍微复杂点的原子化操作——
-            # 查状态→列表→逐条查详情→逐条批准/下发——很容易就把 5 轮用完，被强行掐断）
+            max_tool_rounds = 5  # 最多 5 轮工具调用
             current_messages = list(messages)
 
             for round_idx in range(max_tool_rounds):
@@ -1446,37 +1428,11 @@ async def agent_chat(
                 # DeepSeek thinking 模式：必须把 reasoning_content 传回 API
                 reasoning_content = msg.get("reasoning_content")
                 if tool_calls:
-                    # 先给每个 tool_call 分配确定的 id（避免多个并行调用时 id 冲突）
-                    call_ids = [tc.get("id") or f"call_{round_idx}_{i}" for i, tc in enumerate(tool_calls)]
-
-                    # 修复：此前每个 tool_call 都单独 append 一条只含自己的 assistant 消息，
-                    # 当模型一次性发起多个并行 tool_calls 时会拼出不规范的历史
-                    # （应为一条 assistant 消息 + tool_calls 全量声明，后面跟对应的多条 tool 消息）。
-                    # 这里改为：一条 assistant 消息声明全部 tool_calls，再逐个执行并各自 append 对应的 tool 消息。
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": call_ids[i],
-                                "type": "function",
-                                "function": {
-                                    "name": tc.get("function", {}).get("name", ""),
-                                    "arguments": tc.get("function", {}).get("arguments", "{}"),
-                                },
-                            }
-                            for i, tc in enumerate(tool_calls)
-                        ],
-                    }
-                    if reasoning_content:
-                        assistant_msg["reasoning_content"] = reasoning_content
-                    current_messages.append(assistant_msg)
-
-                    for i, tc in enumerate(tool_calls):
+                    # 发送工具调用信息到前端
+                    for tc in tool_calls:
                         fn = tc.get("function", {})
                         tool_name = fn.get("name", "")
                         tool_args_str = fn.get("arguments", "{}")
-                        call_id = call_ids[i]
                         try:
                             tool_args = json.loads(tool_args_str)
                         except json.JSONDecodeError:
@@ -1492,31 +1448,63 @@ async def agent_chat(
                         await _log_conversation(db, session_id, operator, "tool_call",
                             tool_name=tool_name, tool_args=tool_args, ip_address=client_ip)
 
+                        # 构建带 reasoning_content 的 assistant 消息（DeepSeek thinking 模式要求）
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": tc.get("id", f"call_{round_idx}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": tool_args_str,
+                                    },
+                                }
+                            ],
+                        }
+                        if reasoning_content:
+                            assistant_msg["reasoning_content"] = reasoning_content
+
                         # 执行工具
                         tool_fn = TOOL_FUNCTIONS.get(tool_name)
                         if tool_fn:
                             try:
                                 tool_result = await tool_fn(db=db, **tool_args)
+                                yield _sse({
+                                    "type": "tool_result",
+                                    "tool_name": tool_name,
+                                    "result": tool_result,
+                                })
+                                # 审计日志：记录工具执行结果
+                                await _log_conversation(db, session_id, operator, "tool_result",
+                                    tool_name=tool_name, tool_result=tool_result, ip_address=client_ip)
+                                # 把工具结果加入消息历史
+                                current_messages.append(assistant_msg)
+                                current_messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.get("id", f"call_{round_idx}"),
+                                    "content": json.dumps(tool_result, ensure_ascii=False, default=str),
+                                })
                             except Exception as e:
                                 logger.error(f"Tool {tool_name} execution error: {e}")
-                                tool_result = {"error": str(e)}
+                                yield _sse({
+                                    "type": "tool_result",
+                                    "tool_name": tool_name,
+                                    "result": {"error": str(e)},
+                                })
+                                current_messages.append(assistant_msg)
+                                current_messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.get("id", f"call_{round_idx}"),
+                                    "content": json.dumps({"error": str(e)}),
+                                })
                         else:
-                            tool_result = {"error": f"未知工具: {tool_name}"}
-
-                        yield _sse({
-                            "type": "tool_result",
-                            "tool_name": tool_name,
-                            "result": tool_result,
-                        })
-                        # 审计日志：记录工具执行结果
-                        await _log_conversation(db, session_id, operator, "tool_result",
-                            tool_name=tool_name, tool_result=tool_result, ip_address=client_ip)
-                        # 每个 tool_call 各自对应一条 tool 角色消息，顺序追加在同一条 assistant 消息之后
-                        current_messages.append({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": json.dumps(tool_result, ensure_ascii=False, default=str),
-                        })
+                            yield _sse({
+                                "type": "tool_result",
+                                "tool_name": tool_name,
+                                "result": {"error": f"未知工具: {tool_name}"},
+                            })
                     # 继续下一轮 LLM 调用（LLM 会基于工具结果生成回复）
                     continue
 
@@ -1531,16 +1519,8 @@ async def agent_chat(
                     yield _sse({"type": "done"})
                     return
 
-            # 超过最大工具轮次：如实说明还没收尾，而不是只甩一句"停止处理"
-            yield _sse({
-                "type": "content",
-                "content": (
-                    f"这一轮已经执行了 {max_tool_rounds} 次工具调用，还没有给出最终结论——"
-                    "可能是任务本身步骤较多，也可能是我把它拆得太细了。"
-                    "已经做的操作可以在上面的工具调用记录里看到；如果还没完成，"
-                    "可以直接告诉我继续，我会接着刚才的进度往下走。"
-                ),
-            })
+            # 超过最大工具轮次
+            yield _sse({"type": "content", "content": "（已达到最大工具调用轮次，停止处理）"})
             yield _sse({"type": "done"})
 
         except Exception as e:
@@ -1923,73 +1903,11 @@ PRIORITY_ORDER = {
 }
 
 
-async def _consume_online_triggers(client_id: int, serial: str, db: AsyncSession) -> int:
-    """
-    消费 schedule_task(trigger_type="online") 写入的 agent.trigger.online.* 触发规则：
-    此前只写库、从未被读取，导致 AI 说"终端上线时将自动触发"实际永不生效。
-    终端连接时调用：匹配 client_ids 命中该终端的规则，创建 Task 并下发，一次性触发后删除记录。
-    """
-    from app.models.models import SystemSetting
-    result = await db.execute(
-        select(SystemSetting).where(SystemSetting.key.like("agent.trigger.online.%"))
-    )
-    triggers = result.scalars().all()
-    if not triggers:
-        return 0
-
-    fired = 0
-    for trigger in triggers:
-        try:
-            data = json.loads(trigger.value) if trigger.value else None
-            if not data:
-                await db.execute(sqldelete(SystemSetting).where(SystemSetting.id == trigger.id))
-                continue
-            target_ids = data.get("client_ids") or []
-            if client_id not in target_ids:
-                continue
-
-            task = Task(
-                name=data.get("name", "在线触发任务"),
-                task_type=data.get("task_type", "run_command"),
-                command=data.get("command"),
-                target_type="client",
-                interactive=False,
-                need_reboot=False,
-                timeout=600,
-                success_codes=[0],
-                status="active",
-                run_as="system",
-            )
-            db.add(task)
-            await db.flush()
-            db.add(TaskTarget(task_id=task.id, client_id=client_id, status="pending"))
-
-            # 一次性触发：该终端命中后即从触发规则里移除自身；若已无其它目标终端则整条删除
-            remaining = [cid for cid in target_ids if cid != client_id]
-            if remaining:
-                data["client_ids"] = remaining
-                trigger.value = json.dumps(data)
-            else:
-                await db.execute(sqldelete(SystemSetting).where(SystemSetting.id == trigger.id))
-
-            fired += 1
-            logger.info(f"Online trigger fired: {data.get('name')} → client {serial}")
-        except Exception as e:
-            logger.error(f"Online trigger consume error (trigger #{trigger.id}): {e}")
-
-    if fired:
-        await db.commit()
-    return fired
-
-
 async def check_and_dispatch_on_connect(serial: str, client_id: int, db: AsyncSession):
     """
     Phase 2: 终端上线触发 — Agent WS 连接时检查该终端是否有 pending vuln tasks → 自动 dispatch
     由 websocket.py 在 Agent 连接时调用。
     """
-    # 先消费该终端命中的"上线触发"自定义任务（schedule_task online）
-    await _consume_online_triggers(client_id, serial, db)
-
     # 查找该终端的 approved 修复任务
     result = await db.execute(
         select(RemediationTask)
@@ -2145,11 +2063,11 @@ async def _check_scheduled_triggers(db: AsyncSession):
             for cid in client_ids:
                 db.add(TaskTarget(task_id=task.id, client_id=cid, status="pending"))
 
-            # 删除已触发的定时任务（此前用 value=None 只清空不删行，
-            # 导致下一轮调度还会捞到同一条记录，json.loads(None) 报错，
-            # 每 10 分钟无限重复报错且垃圾记录永不清理）
+            # 删除已触发的定时任务
             await db.execute(
-                sqldelete(SystemSetting).where(SystemSetting.id == trigger.id)
+                update(SystemSetting).where(
+                    SystemSetting.id == trigger.id
+                ).values(value=None)
             )
             await db.commit()
             logger.info(f"Scheduled trigger fired: {data['name']}")

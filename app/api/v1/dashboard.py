@@ -404,12 +404,33 @@ async def list_tasks_admin(
 
     # Batch 0: client hostnames for single-client tasks
     single_client_ids = {t.target_id for t in tasks if t.target_type == "client" and t.target_id}
+    task_need_lookup = [t.id for t in tasks if t.target_type == "client" and not t.target_id]
     client_name_map = {}
     if single_client_ids:
         from app.models.models import Client as _Client
         c_rows = await db.execute(
             select(_Client.id, _Client.hostname).where(_Client.id.in_(single_client_ids)))
         client_name_map = {row.id: row.hostname for row in c_rows}
+    if task_need_lookup:
+        from app.models.models import Client as _Client
+        tt_rows = await db.execute(
+            select(TaskTarget.task_id, TaskTarget.client_id)
+            .where(TaskTarget.task_id.in_(task_need_lookup))
+            .order_by(TaskTarget.id))
+        tt_map = {}
+        tt_client_ids = set()
+        for row in tt_rows:
+            if row.task_id not in tt_map and row.client_id:
+                tt_map[row.task_id] = row.client_id
+                tt_client_ids.add(row.client_id)
+        if tt_client_ids:
+            c_rows2 = await db.execute(
+                select(_Client.id, _Client.hostname).where(_Client.id.in_(tt_client_ids)))
+            for row in c_rows2:
+                client_name_map[row.id] = row.hostname
+        for t in tasks:
+            if t.id in tt_map:
+                t.target_id = tt_map[t.id]
 
     # Batch 1: all packages
     pkg_map = {}
@@ -492,6 +513,23 @@ async def get_task_targets(
         for tt, c in rows
     ]
 
+
+
+# GET /api/tasks/admin/{task_id}/script
+@router.get("/tasks/admin/{task_id}/script")
+async def get_task_script(task_id: int, _: bool = Depends(require_glpi_token), db: AsyncSession = Depends(get_db)):
+    from app.models.models import Task
+    t = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "task not found")
+    return {
+        "id": t.id, "name": t.name, "task_type": t.task_type,
+        "command": t.command or "", "interpreter": t.interpreter or "",
+        "registry_ops": t.registry_ops, "cleanup_paths": t.cleanup_paths,
+        "uninstall_target": t.uninstall_target, "timeout": t.timeout,
+        "run_as": t.run_as, "need_reboot": t.need_reboot,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
 
 # ── POST /api/maintenance/cleanup-reports ──────────────────────────────────
 @router.post("/maintenance/cleanup-reports", response_model=OkResponse)

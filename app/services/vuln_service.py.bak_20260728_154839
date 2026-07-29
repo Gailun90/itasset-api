@@ -143,38 +143,22 @@ def action_summary(fix_type: str, action: Optional[dict]) -> str:
 
 
 # ── 资产匹配 ──────────────────────────────────────────────────────────────────
-def _norm_key(s: str) -> str:
-    """归一化资产名：小写 + 去除所有非字母数字字符（兼容大小写 / 连字符 / 域名后缀等格式差异）"""
-    return re.sub(r"[^a-z0-9]", "", (s or "").strip().lower())
-
-
 async def load_asset_index(db: AsyncSession) -> dict:
-    """一次性加载资产表索引（hostname 小写 / 短名 / 归一化名 / ip）"""
+    """一次性加载资产表索引（hostname 小写 / 短名 / ip）"""
     rows = (await db.execute(select(Client.id, Client.hostname, Client.ip))).all()
-    by_hostname, by_short, by_norm, by_ip = {}, {}, {}, {}
+    by_hostname, by_short, by_ip = {}, {}, {}
     for cid, hostname, ip in rows:
         if hostname:
             h = hostname.strip().lower()
             by_hostname.setdefault(h, cid)
             by_short.setdefault(h.split(".")[0], cid)
-            n = _norm_key(h)
-            if n:
-                by_norm.setdefault(n, cid)
         if ip:
             by_ip.setdefault(ip.strip(), cid)
-    return {"hostname": by_hostname, "short": by_short, "norm": by_norm, "ip": by_ip}
+    return {"hostname": by_hostname, "short": by_short, "ip": by_ip}
 
 
 def match_asset(index: dict, dns_name: Optional[str], ip: Optional[str]):
-    """返回 (asset_id, match_confidence)。
-
-    匹配优先级：
-      1) DNS 全名精确等于资产 hostname（大小写不敏感）
-      2) IP 精确匹配
-      3) DNS 去掉域名后缀后的短名 == 资产短名（e.g. cnpekl0156.office → cnpekl0156）
-      4) DNS 与资产名归一化（去连字符/域名/大小写）后相等（e.g. cnpekl-0156 ↔ cnpekl0156）
-    仅在第 4 种（归一化）命中时记为 fuzzy，避免与精确匹配混淆。
-    """
+    """返回 (asset_id, match_confidence)"""
     d = (dns_name or "").strip().lower()
     i = (ip or "").strip()
     if d and d in index["hostname"]:
@@ -185,9 +169,6 @@ def match_asset(index: dict, dns_name: Optional[str], ip: Optional[str]):
         short = d.split(".")[0]
         if short and short in index["short"]:
             return index["short"][short], "fuzzy"
-        n = _norm_key(d)
-        if n and n in index["norm"]:
-            return index["norm"][n], "fuzzy"
     return None, "unmatched"
 
 

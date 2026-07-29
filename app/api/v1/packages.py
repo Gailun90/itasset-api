@@ -201,6 +201,14 @@ async def register_package(
     db:  AsyncSession = Depends(get_db),
 ):
     """注册包元数据（文件已由调用方放到 packages 目录）"""
+    # 修复：此前 file_hash 允许为空字符串直接入库。一旦某次异步哈希计算失败
+    # （比如 register_package_async.php 里 hash_file() 因故返回 false），
+    # 这个包后续所有下发任务的客户端下载完整性校验会被整段跳过——
+    # 网络中断导致的截断文件会被当成"下载完成"直接拿去执行安装。
+    # 这里强制要求合法的 64 位十六进制 SHA256，从源头堵住空哈希入库。
+    if not file_hash or len(file_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in file_hash):
+        raise HTTPException(status_code=400, detail=f"file_hash 无效或缺失（需要 64 位十六进制 SHA256），拒绝注册包: {name} {version}")
+
     result = await db.execute(
         select(Package).where(Package.name == name, Package.version == version)
     )

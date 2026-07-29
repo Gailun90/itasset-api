@@ -767,10 +767,6 @@ async def rematch_package(
     重新匹配软件安装包（software_upgrade 专用）。
     软件部署库可能晚于任务生成才补充上传，故提供手动重跑匹配；
     匹配成功 → 写入 matched_package_id，下次批准/确认下发即可走 install 通道。
-
-    支持同时指定 target asset_id：当任务缺失关联资产（finding 未匹配到客户端）时，
-    人工匹配一并指定目标计算机，补全 asset_id，使「人工匹配即下发」可行
-    （缺资产的任务下发会被门禁拦下：未匹配资产，无法下发）。
     """
     t = (await db.execute(
         select(RemediationTask).where(RemediationTask.id == task_id)
@@ -779,22 +775,6 @@ async def rematch_package(
         raise HTTPException(404, "任务不存在")
     if t.fix_type != "software_upgrade":
         raise HTTPException(400, "仅 software_upgrade 类型支持重新匹配安装包")
-
-    # ── 补全资产（人工匹配时一并指定目标计算机）──
-    if body.asset_id is not None:
-        client = (await db.execute(
-            select(Client).where(Client.id == body.asset_id)
-        )).scalar_one_or_none()
-        if not client:
-            raise HTTPException(404, f"指定的资产（计算机）#{body.asset_id} 不存在")
-        t.asset_id = body.asset_id
-        # 同步 finding 的资产，保持任务列表/统计一致（仅当 finding 尚未关联时）
-        finding = (await db.execute(
-            select(VulnFinding).where(VulnFinding.id == t.finding_id)
-        )).scalar_one_or_none()
-        if finding and finding.asset_id is None:
-            finding.asset_id = body.asset_id
-
     if body.package_id:
         # 人工指定安装包：直接按 ID 查 Package，跳过模糊自动匹配
         pkg = (await db.execute(

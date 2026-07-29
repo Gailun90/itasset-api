@@ -93,7 +93,6 @@ class ApproveRequest(BaseModel):
     operator:   str = Field(..., min_length=1, max_length=255)   # GLPI 登录名
     comment:    Optional[str] = None
     package_id: Optional[int] = None   # 人工匹配安装包（仅 software_upgrade 的 rematch-package 用）
-    asset_id:   Optional[int] = None   # 人工匹配时一并指定的目标计算机（客户端）ID，用于补全缺失资产
 
 
 class BatchApproveRequest(BaseModel):
