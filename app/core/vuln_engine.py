@@ -28,11 +28,37 @@ REBOOT_BLACKLIST = re.compile(
 )
 
 
+def _strip_comments(command_text: str) -> str:
+    """
+    去掉脚本里的注释行/行尾注释，避免"注释里提到 reboot/restart"被当成真的重启命令。
+    覆盖常见的三种注释写法：
+      - PowerShell / 单行注释: # ...
+      - 批处理行首注释: REM ... / :: ...
+    不追求处理字符串字面量里恰好包含 # 的极端情况——优先避免误伤合法注释，
+    这类命令本身也不该在字符串里写危险操作来"绕过"扫描。
+    """
+    lines = []
+    for line in command_text.splitlines():
+        stripped = line.strip()
+        if stripped[:1] == "#" or stripped.upper().startswith("REM ") or stripped.upper() == "REM" \
+                or stripped[:2] == "::":
+            continue
+        # 行尾 # 注释（PowerShell 风格），简单按第一个 # 截断
+        hash_pos = line.find("#")
+        if hash_pos >= 0:
+            line = line[:hash_pos]
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def scan_reboot_blacklist(command_text: str) -> str | None:
-    """扫描命令内容，若命中重启/关机黑名单则返回匹配到的关键词；否则返回 None。"""
+    """扫描命令内容，若命中重启/关机黑名单则返回匹配到的关键词；否则返回 None。
+    此前会扫描整段原文，导致脚本里"这里不需要重启"这类注释也被当成真实的重启操作拦截；
+    现在先去掉注释行/行尾注释再扫描，只拦真正会执行的重启/关机命令。
+    """
     if not command_text:
         return None
-    m = REBOOT_BLACKLIST.search(command_text)
+    m = REBOOT_BLACKLIST.search(_strip_comments(command_text))
     if m:
         return m.group(0)
     return None
