@@ -1412,7 +1412,8 @@ async def agent_chat(
     async def event_stream():
         """SSE 流式响应"""
         try:
-            max_tool_rounds = 5  # 最多 5 轮工具调用
+            max_tool_rounds = 30  # 最多 30 轮工具调用（此前 5 轮太少，稍微复杂点的原子化操作——
+            # 查状态→列表→逐条查详情→逐条批准/下发——很容易就把 5 轮用完，被强行掐断）
             current_messages = list(messages)
 
             for round_idx in range(max_tool_rounds):
@@ -1530,8 +1531,16 @@ async def agent_chat(
                     yield _sse({"type": "done"})
                     return
 
-            # 超过最大工具轮次
-            yield _sse({"type": "content", "content": "（已达到最大工具调用轮次，停止处理）"})
+            # 超过最大工具轮次：如实说明还没收尾，而不是只甩一句"停止处理"
+            yield _sse({
+                "type": "content",
+                "content": (
+                    f"这一轮已经执行了 {max_tool_rounds} 次工具调用，还没有给出最终结论——"
+                    "可能是任务本身步骤较多，也可能是我把它拆得太细了。"
+                    "已经做的操作可以在上面的工具调用记录里看到；如果还没完成，"
+                    "可以直接告诉我继续，我会接着刚才的进度往下走。"
+                ),
+            })
             yield _sse({"type": "done"})
 
         except Exception as e:
