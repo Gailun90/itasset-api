@@ -1398,7 +1398,7 @@ async def agent_chat(
     async def event_stream():
         """SSE 流式响应"""
         try:
-            max_tool_rounds = 5  # 最多 5 轮工具调用
+            max_tool_rounds = 100  # 最多 100 轮工具调用
             current_messages = list(messages)
 
             for round_idx in range(max_tool_rounds):
