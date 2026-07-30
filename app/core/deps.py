@@ -94,7 +94,12 @@ async def require_glpi_token(
         raise HTTPException(status_code=500, detail="服务器配置错误：GLPI_API_TOKEN 未设置")
     
     scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or token != settings.GLPI_API_TOKEN:
+    # 防御性 strip：.env 曾经是 CRLF 换行导致 GLPI_API_TOKEN 读出来带了一个隐藏的 \r，
+    # 跟 PHP 侧粘贴配置时如果也带了不可见字符，会导致两边比较永远不相等，或者
+    # 更糟——把这个带 \r 的值原样拼进 Authorization 头，被 h11 当成非法请求直接拒绝
+    # （裸 CR 破坏 HTTP 头帧结构），报 "Invalid HTTP request received."。
+    # 这里对两边都做 strip，防止任何一边再次因为不可见空白字符出问题。
+    if scheme.lower() != "bearer" or token.strip() != settings.GLPI_API_TOKEN.strip():
         raise HTTPException(status_code=401, detail="Token 无效")
     return True
 
