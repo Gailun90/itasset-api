@@ -166,8 +166,8 @@ TOOL_DEFINITIONS = [
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "返回数量上限。0 或不传表示不限制（返回全部匹配任务）；传正整数则最多返回该数量。",
-                        "default": 0,
+                        "description": "返回数量上限，默认 20",
+                        "default": 20,
                     },
                 },
             },
@@ -569,7 +569,7 @@ async def tool_list_pending_tasks(
     status: str = "pending",
     risk_level: str = "all",
     fix_type: str = "all",
-    limit: int = 0,
+    limit: int = 20,
 ) -> dict:
     """查看待处理漏洞修复任务"""
     q = (
@@ -598,10 +598,7 @@ async def tool_list_pending_tasks(
         # high 优先, 然后按 id 排序
         RemediationTask.risk_level == "high",
         RemediationTask.id.desc(),
-    )
-    # limit <= 0 表示不限制（返回全部匹配任务）；仅当显式传入正整数时才截断
-    if limit and limit > 0:
-        q = q.limit(limit)
+    ).limit(limit)
 
     rows = (await db.execute(q)).all()
     tasks = []

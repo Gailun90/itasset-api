@@ -109,6 +109,19 @@ async def agent_websocket(
                     timeout=HEARTBEAT_INTERVAL + 30,
                 )
 
+                # 修复：这里用的是 Starlette 底层 websocket.receive()，返回原始 ASGI
+                # 消息字典。客户端真正断开时会收到 {"type": "websocket.disconnect"}，
+                # 这种消息既没有 "bytes" 也没有 "text" 字段——此前代码遇到它会直接
+                # continue 回到循环顶部再调一次 receive()，但 Starlette 在已经收到
+                # disconnect 消息后不允许再次 receive()，会抛
+                # "Cannot call receive once a disconnect message has been received."。
+                # 结果是：几乎每一次正常断线（客户端更新重启、网络抖动、正常退出）
+                # 都会走到这个异常分支，被当成 ERROR 打进日志——3 天内出现了近万次，
+                # 但其实绝大多数只是普通的断线，不是真的故障。
+                if raw.get("type") == "websocket.disconnect":
+                    logger.info(f"WS client disconnect [{serial}]: code={raw.get('code')}")
+                    break
+
                 # ★ v4.8: Handle binary messages (raw JPEG frame from agent)
                 if "bytes" in raw and raw["bytes"] is not None:
                     # Binary JPEG frame — broadcast as binary to all viewers
