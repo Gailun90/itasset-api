@@ -391,24 +391,38 @@ async def report_task_result(
         if rt and not body.deferred:
             rt.result_log = (body.message or "")[:2000]
 
-            if not body.success:
+            if tt.is_verify:
+                # ── 声明式验证子任务回报（独立分支，不触发修复状态机）──
+                # 由 _post_verify_command 处理：通过→done；未过→计数+自动重下发/转人工
+                await _post_verify_command(db, rt, tt, body)
+            elif not body.success:
                 # 失败 → 终态 failed（需人工介入）
                 if rt.status in ("dispatched",):
                     rt.status = "failed"
                 logger.info("修复任务 #%s 执行失败 → failed（target #%s）", rt.id, tt.id)
             else:
-                # 成功 → 按 fix_type 决定是否进入后校验
-                needs_verify = rt.fix_type in ("registry_fix", "patch_install")
-                
-                if needs_verify and rt.status == "dispatched":
+                # 成功 → 按是否有验证判定条件决定是否进入 pending_verify
+                has_verify_spec = bool((rt.action_json or {}).get("verify"))
+                # 声明式验证优先；无声明式判定时，registry_fix/patch_install 走 legacy 后校验
+                legacy_verify = (not has_verify_spec) and rt.fix_type in ("registry_fix", "patch_install")
+
+                if (has_verify_spec or legacy_verify) and rt.status == "dispatched":
                     # ── 进入 pending_verify（后校验）──
                     rt.status = "pending_verify"
                     tt.status = "pending_verify"
-                    logger.info("修复任务 #%s → pending_verify（fix_type=%s，target #%s）",
-                                rt.id, rt.fix_type, tt.id)
+                    logger.info("修复任务 #%s → pending_verify（fix_type=%s，has_verify_spec=%s，target #%s）",
+                                rt.id, rt.fix_type, has_verify_spec, tt.id)
+                    if has_verify_spec and not legacy_verify:
+                        # 声明式验证：on-the-fly 下发验证子任务（run_command + build_verify_command）
+                        from app.api.v1.vuln import _dispatch_verify
+                        ok = await _dispatch_verify(db, rt, tt)
+                        if not ok:
+                            # 安全校验拦截 → 转人工
+                            rt.status = "needs_manual"
+                            logger.warning("修复任务 #%s 验证脚本安全校验拦截 → needs_manual", rt.id)
 
-                elif not needs_verify and rt.status == "dispatched":
-                    # 直通类型（software_uninstall / software_upgrade 等）→ done
+                elif not has_verify_spec and not legacy_verify and rt.status == "dispatched":
+                    # 直通类型（software_uninstall / software_upgrade / shell_exec 无判定等）→ done
                     rt.status = "done"
                     logger.info("修复任务 #%s → done（fix_type=%s，target #%s）",
                                 rt.id, rt.fix_type, tt.id)
@@ -470,6 +484,13 @@ async def _post_verify(db: AsyncSession, tt: TaskTarget, body: TaskResultRequest
     if not rt or rt.status != "pending_verify":
         return
 
+    # 声明式验证（action_json 含 verify，由 is_verify 子任务单独回报）不在此处处理，
+    # 避免与 _post_verify_command 重复判定；此处仅服务 legacy registry_fix/patch_install。
+    if (rt.action_json or {}).get("verify"):
+        return
+    if rt.fix_type not in ("registry_fix", "patch_install"):
+        return
+
     verify_ok = True
 
     if rt.fix_type == "registry_fix":
@@ -501,6 +522,55 @@ async def _post_verify(db: AsyncSession, tt: TaskTarget, body: TaskResultRequest
             logger.warning("修复任务 #%s 无 rollback_plan，停在 rollback_required 等待人工处理", rt.id)
 
     await db.commit()
+
+
+async def _post_verify_command(db: AsyncSession, rt: "RemediationTask",
+                               tt: TaskTarget, body: TaskResultRequest):
+    """声明式验证子任务（is_verify=True）回报处理（report_task_result 的子流程）。
+
+    验证通过 → rt → done（记 verified 日志）；
+    验证未通过 → verify_attempts+1：
+        - 未达上限 → 重新下发修复任务（_requeue_fix，rt 回到 dispatched，
+          修复成功后再进 pending_verify 重新验证），形成「修复→验证→未过→再修复」自动循环；
+        - 已达上限 → rt → needs_manual（转人工循环/接管）。
+    注意：本函数不自行 commit，由 report_task_result 的外层 await db.commit() 统一提交，
+    以便与父验证任务（Task）的状态聚合一起落库。
+    """
+    if rt.status != "pending_verify":
+        # 可能已被并发/其它流程改变，避免重复处理
+        return
+    if not tt.is_verify:
+        return
+
+    max_a = rt.verify_max_attempts or 3
+
+    if body.success:
+        rt.status = "done"
+        tt.status = "success"
+        rt.result_log = ((rt.result_log or "") + f"\n验证通过（声明式，第{(rt.verify_attempts or 0) + 1}次）").strip()
+        logger.info("修复任务 #%s 验证通过 → done（verify attempt #%s）",
+                    rt.id, (rt.verify_attempts or 0) + 1)
+    else:
+        rt.verify_attempts = (rt.verify_attempts or 0) + 1
+        logger.warning("修复任务 #%s 验证未通过（attempt #%s / max %s）",
+                       rt.id, rt.verify_attempts, max_a)
+        if rt.verify_attempts < max_a:
+            tt.status = "failed"
+            rt.result_log = ((rt.result_log or "") +
+                             f"\n验证未通过（第{rt.verify_attempts}次），自动重下发修复").strip()
+            from app.api.v1.vuln import _requeue_fix
+            reason = await _requeue_fix(db, rt, tt)
+            if reason:
+                rt.status = "needs_manual"
+                logger.warning("修复任务 #%s 重下发被门禁拦截：%s → needs_manual", rt.id, reason)
+            # 成功则 _requeue_fix 已通过 _do_dispatch 将 rt 置回 dispatched
+        else:
+            rt.status = "needs_manual"
+            tt.status = "failed"
+            rt.result_log = ((rt.result_log or "") +
+                             f"\n验证连续 {rt.verify_attempts} 次未通过 → 转人工").strip()
+            logger.warning("修复任务 #%s 验证连续 %s 次未通过 → needs_manual（转人工循环）",
+                           rt.id, rt.verify_attempts)
 
 
 def _verify_registry_fix(rt: "RemediationTask", body: TaskResultRequest) -> bool:

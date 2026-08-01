@@ -67,6 +67,8 @@ class TaskListItem(BaseModel):
     auto_approve:     bool = False
     status:           str
     match_confidence: Optional[str] = None
+    verify_attempts:   Optional[int] = None   # 已执行的「修复+验证」循环次数（声明式验证）
+    verify_max_attempts: Optional[int] = None  # 验证最大重试次数（达上限仍不通过 → needs_manual）
     created_at:       Optional[datetime] = None
 
     class Config:

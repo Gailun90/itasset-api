@@ -418,3 +418,70 @@ exit 0
 '''
     body = body.replace("__KB__", kb_arr)
     return header + body
+
+
+# ── 声明式验证条件 → Windows .bat 校验脚本 ─────────────────────────────────
+# spec: list[dict]，每项一种检查；全部通过 → exit /b 0（RESULT=VERIFY_PASSED），
+# 任一不通过 → exit /b 1（RESULT=VERIFY_FAILED）。客户端以退出码判定验证结果。
+# 检查类型：
+#   file_not_exists    {path}                    文件不存在=通过
+#   file_exists        {path}                    文件存在=通过
+#   registry_equals     {hive,path,name,value}    注册表值等于=通过
+#   registry_not_exists {hive,path,name}          注册表值/项不存在=通过
+#   service_stopped     {name}                    服务已停止=通过
+#   service_running     {name}                    服务运行中=通过
+#   command             {cmd}                     自定义命令，退出码 0=通过
+
+def _vq_escape(s) -> str:
+    """去掉会破坏 .bat 双引号的字符并剔除换行，用于拼接到 "..." 的值。"""
+    if s is None:
+        return ""
+    return str(s).replace("\r", "").replace("\n", " ").replace('"', "")
+
+
+def build_verify_command(spec) -> str:
+    if not spec:
+        return "@echo off\r\nrem no verify spec\r\necho RESULT=VERIFY_PASSED\r\nexit /b 0\r\n"
+    lines = ["@echo off", 'set "VR_FAIL=0"']
+    for i, chk in enumerate(spec):
+        t = (chk.get("type") or "").lower()
+        if t == "file_not_exists":
+            p = _vq_escape(chk.get("path", ""))
+            lines.append('if exist "%s" ( echo VERIFY_FAIL[%d] file_not_exists:%s & set "VR_FAIL=1" )' % (p, i, p))
+        elif t == "file_exists":
+            p = _vq_escape(chk.get("path", ""))
+            lines.append('if not exist "%s" ( echo VERIFY_FAIL[%d] file_exists:%s & set "VR_FAIL=1" )' % (p, i, p))
+        elif t == "registry_equals":
+            hive = _vq_escape(chk.get("hive", "HKLM")) or "HKLM"
+            path = _vq_escape(chk.get("path", ""))
+            name = _vq_escape(chk.get("name", ""))
+            val = _vq_escape(chk.get("value", ""))
+            key = hive + "\\" + path
+            lines.append('reg query "%s" /v "%s" 2>nul | findstr /i /c:"%s" >nul' % (key, name, val))
+            lines.append(r'if errorlevel 1 ( echo VERIFY_FAIL[%d] registry_equals:%s\%s expected=%s & set "VR_FAIL=1" )' % (i, key, name, val))
+        elif t == "registry_not_exists":
+            hive = _vq_escape(chk.get("hive", "HKLM")) or "HKLM"
+            path = _vq_escape(chk.get("path", ""))
+            name = _vq_escape(chk.get("name", ""))
+            key = hive + "\\" + path
+            lines.append('reg query "%s" /v "%s" >nul 2>nul' % (key, name))
+            lines.append(r'if not errorlevel 1 ( echo VERIFY_FAIL[%d] registry_not_exists:%s\%s & set "VR_FAIL=1" )' % (i, key, name))
+        elif t == "service_stopped":
+            name = _vq_escape(chk.get("name", ""))
+            lines.append('sc query "%s" | findstr /i "STOPPED" >nul' % name)
+            lines.append('if errorlevel 1 ( echo VERIFY_FAIL[%d] service_stopped:%s & set "VR_FAIL=1" )' % (i, name))
+        elif t == "service_running":
+            name = _vq_escape(chk.get("name", ""))
+            lines.append('sc query "%s" | findstr /i "RUNNING" >nul' % name)
+            lines.append('if errorlevel 1 ( echo VERIFY_FAIL[%d] service_running:%s & set "VR_FAIL=1" )' % (i, name))
+        elif t == "command":
+            cmd = (chk.get("cmd") or "").replace("\r", "").replace("\n", " & ")
+            lines.append('rem verify command[%d]' % i)
+            lines.append(cmd)
+            lines.append('if errorlevel 1 ( echo VERIFY_FAIL[%d] command & set "VR_FAIL=1" )' % i)
+        else:
+            lines.append('echo VERIFY_WARN unknown check type: %s' % t)
+    lines.append('if %VR_FAIL%==1 ( echo RESULT=VERIFY_FAILED & exit /b 1 )')
+    lines.append('echo RESULT=VERIFY_PASSED')
+    lines.append('exit /b 0')
+    return "\r\n".join(lines) + "\r\n"

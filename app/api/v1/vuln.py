@@ -30,6 +30,7 @@ from app.core.vuln_engine import (
     can_transition,
     gate_reason as _gate_reason_pure,
     build_patch_install_script,
+    build_verify_command,
     IRREVERSIBLE_FIX_TYPES,
     DEFAULT_EXCLUDED_DISPATCH_ROLES,
     build_grouping_key,
@@ -563,7 +564,8 @@ async def _dispatch_to_agent(db: AsyncSession, task: RemediationTask,
 
 
 async def _do_dispatch(db: AsyncSession, task: RemediationTask,
-                       finding: VulnFinding, for_auto: bool) -> str | None:
+                       finding: VulnFinding, for_auto: bool,
+                       force: bool = False) -> str | None:
     """
     门禁 + 下发。成功返回 None（task.status 已置 dispatched），失败返回原因（task 保持 approved）。
 
@@ -578,6 +580,11 @@ async def _do_dispatch(db: AsyncSession, task: RemediationTask,
         )).scalar_one_or_none()
         if pol and pol.kill_switch:
             return "全局熔断已开启（kill_switch=true），所有自动下发已暂停。需管理员在管理面手动关闭熔断后重试。"
+
+    # 人工确认下发（for_auto=False，含 needs_manual 重试）视为新一轮修复循环：
+    # 重置验证计数，让"人工循环执行"从 0 开始重新跑自动验证重试；自动重下发（for_auto=True）保留累计计数。
+    if not for_auto:
+        task.verify_attempts = 0
 
     rule = await _find_rule(db, finding)
     reason = await _gate_reason(db, task, rule, for_auto)
@@ -600,57 +607,124 @@ async def _do_dispatch(db: AsyncSession, task: RemediationTask,
         logger.info("修复任务 #%s 无对应 QID 规则，使用任务 action_json 下发", task.id)
     # ── 下发即定版：把实际生效的动作写入任务快照 ──
     task.action_json = dict(action)
+    # ── 声明式验证：把规则的 verify 判定条件带入任务快照（含默认最大重试次数）──
+    # 验证子任务（_dispatch_verify）与自动重试（_requeue_fix）都直接读 rt.action_json，
+    # 不依赖规则后续被改。verify_max_attempts 同时写入列，供 _post_verify_command 计数。
+    if action.get("verify") is not None:
+        task.action_json["verify"] = action["verify"]
+    task.verify_max_attempts = action.get("verify_max_attempts") or 3
 
     # ── 自动金丝雀：决定本次是「进入首批下发」还是「排队等放量」──
     # verified 规则直接全量下发（canary_dispatch_decision 会返回 dispatch，但下面整段跳过）。
     # pending / in_progress 规则：按 autonomy_rules 的批次大小控制放量节奏。
     if rule.canary_status in (CANARY_STATUS_PENDING, CANARY_STATUS_IN_PROGRESS):
-        # ── 细粒度分组键（最终形态·二）：同一资产画像组的机器进入同一金丝雀小批量 ──
-        prof = None
-        if task.asset_id is not None:
-            prof = (await db.execute(
-                select(AssetProfile).where(AssetProfile.client_id == task.asset_id)
-            )).scalar_one_or_none()
-        group_key = build_grouping_key(
-            finding.qid, task.fix_type, task.risk_level,
-            prof.ou if prof else None,
-            prof.role if prof else None,
-            prof.maintenance_window if prof else None,
-        )
-        task.dispatch_group_key = group_key
-
-        autonomy = await _load_autonomy_rules(db)
-        params = resolve_autonomy_params(rule.fix_type, rule.default_risk_level, autonomy)
-        batch_size = params["canary_batch_size"]
-        # 统计本规则 + 同分组键 已实际下发（进入首批）的任务数（同组同批）
-        dispatched_in_batch = (await db.execute(
-            select(func.count()).where(
-                RemediationTask.rule_id == rule.id,
-                RemediationTask.dispatch_group_key == group_key,
-                RemediationTask.canary_batch.is_(True),
-                RemediationTask.status.in_(
-                    ["dispatched", "done", "failed", "pending_verify", "rollback_required"]),
+        if force:
+            # 重试重下发（force）：跳过金丝雀排队，直接进入首批下发，
+            # 避免验证循环被 canary 排队长期卡住（验证重试应确定性推进）
+            task.canary_batch = True
+            task.rule_id = rule.id
+        else:
+            # ── 细粒度分组键（最终形态·二）：同一资产画像组的机器进入同一金丝雀小批量 ──
+            prof = None
+            if task.asset_id is not None:
+                prof = (await db.execute(
+                    select(AssetProfile).where(AssetProfile.client_id == task.asset_id)
+                )).scalar_one_or_none()
+            group_key = build_grouping_key(
+                finding.qid, task.fix_type, task.risk_level,
+                prof.ou if prof else None,
+                prof.role if prof else None,
+                prof.maintenance_window if prof else None,
             )
-        )).scalar() or 0
-        decision = canary_dispatch_decision(rule.canary_status, dispatched_in_batch, batch_size)
-        task.rule_id = rule.id
-        if decision == CANARY_DECISION_QUEUE:
-            # 排队等放量：系统自己记着，不卡人工；观察窗口到点由 scheduler 自动放量
-            task.status = "canary_waiting"
-            await db.commit()
-            return (f"规则 #{rule.id}（QID {rule.qid}）处于金丝雀观察期，"
-                    f"本机排队等待放量（同组首批 {dispatched_in_batch}/{batch_size}，组={group_key}）")
-        # 进入首批：标记本任务为 canary 样本，并启动观察窗口
-        task.canary_batch = True
-        if rule.canary_status == CANARY_STATUS_PENDING:
-            rule.canary_status = CANARY_STATUS_IN_PROGRESS
-            rule.canary_started_at = datetime.now(timezone.utc)
+            task.dispatch_group_key = group_key
+
+            autonomy = await _load_autonomy_rules(db)
+            params = resolve_autonomy_params(rule.fix_type, rule.default_risk_level, autonomy)
+            batch_size = params["canary_batch_size"]
+            # 统计本规则 + 同分组键 已实际下发（进入首批）的任务数（同组同批）
+            dispatched_in_batch = (await db.execute(
+                select(func.count()).where(
+                    RemediationTask.rule_id == rule.id,
+                    RemediationTask.dispatch_group_key == group_key,
+                    RemediationTask.canary_batch.is_(True),
+                    RemediationTask.status.in_(
+                        ["dispatched", "done", "failed", "pending_verify", "rollback_required"]),
+                )
+            )).scalar() or 0
+            decision = canary_dispatch_decision(rule.canary_status, dispatched_in_batch, batch_size)
+            task.rule_id = rule.id
+            if decision == CANARY_DECISION_QUEUE:
+                # 排队等放量：系统自己记着，不卡人工；观察窗口到点由 scheduler 自动放量
+                task.status = "canary_waiting"
+                await db.commit()
+                return (f"规则 #{rule.id}（QID {rule.qid}）处于金丝雀观察期，"
+                        f"本机排队等待放量（同组首批 {dispatched_in_batch}/{batch_size}，组={group_key}）")
+            # 进入首批：标记本任务为 canary 样本，并启动观察窗口
+            task.canary_batch = True
+            if rule.canary_status == CANARY_STATUS_PENDING:
+                rule.canary_status = CANARY_STATUS_IN_PROGRESS
+                rule.canary_started_at = datetime.now(timezone.utc)
 
     reason = await _dispatch_to_agent(db, task, finding, action)
     if reason:
         return reason
     task.status = "dispatched"
     return None
+
+
+async def _dispatch_verify(db: AsyncSession, rt: "RemediationTask",
+                           fix_tt: "TaskTarget") -> bool:
+    """
+    下发声明式验证子任务（run_command + build_verify_command 生成的 .bat）。
+
+    复用现有 run_command 通道，客户端以退出码判定：0 → RESULT=VERIFY_PASSED（验证通过），
+    非 0 → RESULT=VERIFY_FAILED（未达判定条件）。验证子任务回报由 agent.py 的
+    _post_verify_command 处理（其 TaskTarget.is_verify=True）。
+
+    返回 True 表示已下发；False 表示安全校验拦截（上层应转 needs_manual）。
+    """
+    spec = (rt.action_json or {}).get("verify")
+    cmd = build_verify_command(spec)
+    # P0 安全：验证脚本不得含重启/关机关键词（与修复脚本同等严格）
+    hit = scan_reboot_blacklist(cmd)
+    if hit:
+        logger.error("修复任务 #%s 验证脚本命中禁止的重启/关机关键词: %s", rt.id, hit)
+        return False
+    vt = Task(
+        name=f"验证 修复任务 #{rt.id}（声明式判定 #{(rt.verify_attempts or 0) + 1}）",
+        task_type="run_command", command=cmd, interpreter="cmd",
+        target_type="client",
+        interactive=False, need_reboot=False, timeout=120,
+        success_codes=[0], status="active", run_as="system",
+    )
+    db.add(vt)
+    await db.flush()   # 拿 vt.id
+    db.add(TaskTarget(
+        task_id=vt.id, client_id=fix_tt.client_id,
+        remediation_task_id=rt.id, status="pending", is_verify=True,
+    ))
+    logger.info("修复任务 #%s 已下发验证子任务（verify attempt #%s，agent task #%s）",
+                rt.id, (rt.verify_attempts or 0) + 1, vt.id)
+    return True
+
+
+async def _requeue_fix(db: AsyncSession, rt: "RemediationTask",
+                       tt: "TaskTarget") -> str | None:
+    """
+    验证失败后重新下发修复任务（自动重试，最多 verify_max_attempts 次）。
+
+    复用 _do_dispatch 重新生成修复 Task。force=True 跳过金丝雀排队，确保重试确定性推进。
+    返回 None 表示已重新下发（rt.status 回到 dispatched）；否则返回原因（上层转 needs_manual）。
+    """
+    finding = (await db.execute(
+        select(VulnFinding).where(VulnFinding.id == rt.finding_id)
+    )).scalar_one_or_none()
+    if not finding:
+        logger.error("修复任务 #%s 重下发失败：关联 finding #%s 不存在", rt.id, rt.finding_id)
+        return "关联 finding 不存在，无法重下发"
+    # force=True：跳过金丝雀排队，确保重试必定进入下发（避免验证循环被 canary 卡住）
+    reason = await _do_dispatch(db, rt, finding, for_auto=True, force=True)
+    return reason
 
 
 async def _set_task_status(db, task_id: int, nxt: str, operator: str) -> RemediationTask:
@@ -706,8 +780,9 @@ async def dispatch_task(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    显式「确认下发」：approved → dispatched。
-    适用于：批准时被闸住的任务（high 风险 或 规则当时未转正、现已转正）。
+    显式「确认下发」：approved → dispatched（needs_manual → dispatched 亦允许，视为人工重试，重置验证计数）。
+    适用于：批准时被闸住的任务（high 风险 或 规则当时未转正、现已转正）；
+            或验证连续不通过已转 needs_manual 的任务，由人工重新触发修复+验证循环。
     规则闸仍然生效（必须 active）；high 风险在此视为已获得人工二次确认。
     """
     t = (await db.execute(
@@ -715,8 +790,8 @@ async def dispatch_task(
     )).scalar_one_or_none()
     if not t:
         raise HTTPException(404, "任务不存在")
-    if t.status != "approved":
-        raise HTTPException(409, f"任务当前状态为 {t.status}，仅「已批准」状态可确认下发")
+    if t.status not in ("approved", "needs_manual"):
+        raise HTTPException(409, f"任务当前状态为 {t.status}，仅「已批准 / 已转人工」状态可确认下发")
     if t.fix_type not in AUTO_DISPATCH_FIX_TYPES:
         raise HTTPException(400, f"fix_type={t.fix_type} 不支持下发执行")
 

@@ -127,6 +127,8 @@ class TaskTarget(Base):
     client_id:    Mapped[int]           = mapped_column(Integer, ForeignKey("clients.id", ondelete="CASCADE"))
     # 漏洞修复联动：若本 target 由 remediation_task 下发，回报结果时回写该修复任务
     remediation_task_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("remediation_tasks.id", ondelete="SET NULL"))
+    # is_verify：本 target 为「验证子任务」（修复成功后下发的判定条件检查），回报时走验证分支
+    is_verify:    Mapped[bool]           = mapped_column(Boolean, default=False, nullable=False)
     status:       Mapped[str]           = mapped_column(String(32), default="pending")
     # pending | running | success | failed | deferred | cancelled
     # 新增中间态：pending_verify（Agent 上报 success 后等待后校验）| rollback_required（后校验不达标）

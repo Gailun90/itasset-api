@@ -104,6 +104,10 @@ class RemediationTask(Base):
     result_log:      Mapped[Optional[str]] = mapped_column(Text)          # 第二阶段执行通道回写
     verified_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     verified_result: Mapped[Optional[str]] = mapped_column(String(32))    # 第二阶段复扫验证结果（复扫验证，非执行结果）
+    # ── 验证循环（声明式判定条件 + 自动重试）──
+    # verify_attempts：已执行的「修复+验证」循环次数（含首次）。达到 verify_max_attempts 仍不通过 → needs_manual。
+    verify_attempts:     Mapped[int]           = mapped_column(Integer, default=0, nullable=False)
+    verify_max_attempts: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 空=用规则默认（3）
     # ── 回滚方案（下发时从规则带过来的快照）──
     rollback_plan:   Mapped[Optional[dict]]= mapped_column(JsonVariant)
     # ── 规则版本追踪 ──
