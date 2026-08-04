@@ -102,6 +102,21 @@ async def agent_websocket(
         except Exception:
             logger.exception(f"WS重连检查待处理任务失败: {serial}")
 
+        # 修复：check_and_dispatch_on_connect（终端上线自动下发已批准的漏洞修复任务 +
+        # 消费 schedule_task(trigger_type="online") 写入的上线触发规则）此前虽然
+        # 在 agent_chat.py 里完整存在，但从来没有任何地方真正调用过它——这个连接点
+        # 在并行改动中被删掉了，导致"终端上线时自动触发"这整条能力从未真正跑起来过。
+        try:
+            from app.api.v1.agent_chat import check_and_dispatch_on_connect
+            async with AsyncSessionLocal() as _db2:
+                _client_row = (await _db2.execute(
+                    _select(_Client.id).where(_Client.hash_serial == serial)
+                )).first()
+                if _client_row:
+                    await check_and_dispatch_on_connect(serial, _client_row[0], _db2)
+        except Exception:
+            logger.exception(f"WS连接触发 check_and_dispatch_on_connect 失败: {serial}")
+
         while True:
             try:
                 raw = await asyncio.wait_for(

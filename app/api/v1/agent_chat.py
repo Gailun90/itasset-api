@@ -25,7 +25,7 @@ from fastapi import (
     Form, Query as FastQuery,
 )
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, update, and_, or_, Text, String, Integer, Boolean, DateTime, Index
+from sqlalchemy import select, func, update, delete as sqldelete, and_, or_, Text, String, Integer, Boolean, DateTime, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1906,11 +1906,82 @@ PRIORITY_ORDER = {
 }
 
 
+async def _consume_online_triggers(client_id: int, serial: str, db: AsyncSession) -> int:
+    """
+    消费 schedule_task(trigger_type="online") 写入的 agent.trigger.online.* 触发规则。
+
+    此前这个函数完整存在过，但在后续的并行改动里被整段删掉了，导致 AI 告诉用户
+    "终端上线时将自动触发"，实际上这个 SystemSetting 记录从写入那一刻起就没有任何
+    代码会去读它——包括 2026-08-01 那次让 AI 安排的"终端上线清理恶意 BAT 文件"任务
+    （agent.trigger.online.2d525d77，覆盖 6 台终端），两天过去了，这几台机器只要
+    上线过就应该被清理，但因为这个函数不存在，一次都没有真正执行过。
+
+    终端连接时调用：匹配 client_ids 命中该终端的规则，创建 Task 并下发，
+    一次性触发后从触发规则的 client_ids 里移除自身；全部命中完后删除整条记录。
+    """
+    from app.models.models import SystemSetting
+    result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key.like("agent.trigger.online.%"))
+    )
+    triggers = result.scalars().all()
+    if not triggers:
+        return 0
+
+    fired = 0
+    for trigger in triggers:
+        try:
+            data = json.loads(trigger.value) if trigger.value else None
+            if not data:
+                await db.execute(sqldelete(SystemSetting).where(SystemSetting.key == trigger.key))
+                continue
+            target_ids = data.get("client_ids") or []
+            if client_id not in target_ids:
+                continue
+
+            task = Task(
+                name=data.get("name", "在线触发任务"),
+                task_type=data.get("task_type", "run_command"),
+                command=data.get("command"),
+                target_type="client",
+                interactive=False,
+                need_reboot=False,
+                timeout=600,
+                success_codes=[0],
+                status="active",
+                run_as="system",
+            )
+            db.add(task)
+            await db.flush()
+            db.add(TaskTarget(task_id=task.id, client_id=client_id, status="pending"))
+
+            remaining = [cid for cid in target_ids if cid != client_id]
+            if remaining:
+                data["client_ids"] = remaining
+                trigger.value = json.dumps(data)
+            else:
+                await db.execute(sqldelete(SystemSetting).where(SystemSetting.key == trigger.key))
+
+            fired += 1
+            logger.info(f"Online trigger fired: {data.get('name')} → client {serial}")
+        except Exception as e:
+            logger.error(f"Online trigger consume error (trigger {trigger.key}): {e}", exc_info=True)
+            await db.rollback()
+            continue
+
+    if fired:
+        await db.commit()
+    return fired
+
+
 async def check_and_dispatch_on_connect(serial: str, client_id: int, db: AsyncSession):
     """
     Phase 2: 终端上线触发 — Agent WS 连接时检查该终端是否有 pending vuln tasks → 自动 dispatch
     由 websocket.py 在 Agent 连接时调用。
     """
+    # 先消费该终端命中的"上线触发"自定义任务（schedule_task online）——
+    # 这一步此前在并行改动里被整段删掉了，现在补回来
+    await _consume_online_triggers(client_id, serial, db)
+
     # 查找该终端的 approved 修复任务
     result = await db.execute(
         select(RemediationTask)
@@ -1959,10 +2030,19 @@ async def run_agent_scheduler():
     """
     Phase 2: 定时扫描 — 每 10 分钟扫描在线终端 + pending tasks → 按优先级排序 → 逐步 dispatch
     在 main.py lifespan 中启动。
+
+    修复：此前是"先 sleep 600 秒再检查"，也就是说服务每重启一次，这个 10 分钟倒计时
+    就重新清零一次。今天为了让各种改动生效重启了很多次 itasset-api，导致这个循环
+    很可能一次都没真正跑到检查这一步。改成"先检查、再 sleep"，服务重启后至少能
+    立刻做一次扫描，不用等一个完整的 10 分钟窗口。
     """
+    first_run = True
     while True:
         try:
-            await asyncio.sleep(600)  # 10 分钟
+            if first_run:
+                first_run = False
+            else:
+                await asyncio.sleep(600)  # 10 分钟
             logger.info("Agent scheduler: running periodic scan...")
 
             from app.core.database import AsyncSessionLocal
@@ -2066,14 +2146,21 @@ async def _check_scheduled_triggers(db: AsyncSession):
             for cid in client_ids:
                 db.add(TaskTarget(task_id=task.id, client_id=cid, status="pending"))
 
-            # 删除已触发的定时任务
+            # 修复：SystemSetting 的主键是 key，不是 id（模型里根本没有 id 这个属性）。
+            # 此前这里写的是 SystemSetting.id == trigger.id，一执行就抛
+            # AttributeError（Python 级别的错误，SQL 都发不出去），被下面的
+            # except 兜住但从未 db.rollback()，导致前面刚创建好、已经 flush
+            # 但还没 commit 的 Task/TaskTarget，随着这个函数所在的
+            # `async with AsyncSessionLocal() as db:` 正常退出而被隐式回滚——
+            # 也就是说，每一次定时触发任务到期，都会在"看起来已经创建成功"之后，
+            # 静默地整个消失，数据库里什么都不会留下。这是"AI 设置的定时任务
+            # 总是失效"的直接原因之一。
             await db.execute(
-                update(SystemSetting).where(
-                    SystemSetting.id == trigger.id
-                ).values(value=None)
+                sqldelete(SystemSetting).where(SystemSetting.key == trigger.key)
             )
             await db.commit()
             logger.info(f"Scheduled trigger fired: {data['name']}")
 
         except Exception as e:
-            logger.error(f"Scheduled trigger error: {e}")
+            logger.error(f"Scheduled trigger error: {e}", exc_info=True)
+            await db.rollback()
