@@ -1668,6 +1668,85 @@ def _sse(data: dict) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# GET/DELETE /api/agent/triggers — AI 定时/上线触发任务列表（前台"软件分发"菜单下的展示页用）
+# ════════════════════════════════════════════════════════════════════════════
+
+@router.get("/triggers")
+async def list_agent_triggers(
+    _: bool = Depends(require_glpi_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    列出所有还没触发完的 AI 定时/上线任务（schedule_task 工具写入的
+    agent.trigger.scheduled.* / agent.trigger.online.* 记录）。
+    """
+    from app.models.models import SystemSetting, Client
+
+    result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key.like("agent.trigger.%"))
+    )
+    rows = result.scalars().all()
+
+    # 批量取 client 主机名，避免逐条查询
+    all_client_ids: set[int] = set()
+    parsed_rows = []
+    for r in rows:
+        try:
+            data = json.loads(r.value) if r.value else {}
+        except json.JSONDecodeError:
+            data = {}
+        cids = data.get("client_ids") or []
+        all_client_ids.update(cids)
+        parsed_rows.append((r, data, cids))
+
+    hostnames: dict[int, str] = {}
+    if all_client_ids:
+        cres = await db.execute(
+            select(Client.id, Client.hostname).where(Client.id.in_(all_client_ids))
+        )
+        hostnames = {cid: hn for cid, hn in cres.all()}
+
+    triggers = []
+    for r, data, cids in parsed_rows:
+        trigger_type = "scheduled" if r.key.startswith("agent.trigger.scheduled.") else "online"
+        triggers.append({
+            "key": r.key,
+            "trigger_type": trigger_type,
+            "name": data.get("name", "(未命名)"),
+            "task_type": data.get("task_type"),
+            "command": data.get("command"),
+            "priority": data.get("priority"),
+            "scheduled_at": data.get("scheduled_at"),
+            "created_at": data.get("created_at"),
+            "target_clients": [
+                {"id": cid, "hostname": hostnames.get(cid, f"#{cid}（终端已删除）")}
+                for cid in cids
+            ],
+            "remaining_count": len(cids),
+        })
+
+    triggers.sort(key=lambda t: t.get("created_at") or "", reverse=True)
+    return {"triggers": triggers}
+
+
+@router.delete("/triggers/{trigger_key}")
+async def cancel_agent_trigger(
+    trigger_key: str,
+    _: bool = Depends(require_glpi_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """取消一个还没触发的 AI 定时/上线任务"""
+    from app.models.models import SystemSetting
+    if not trigger_key.startswith("agent.trigger."):
+        raise HTTPException(status_code=400, detail="非法的 trigger key")
+    result = await db.execute(sqldelete(SystemSetting).where(SystemSetting.key == trigger_key))
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="未找到该触发任务（可能已经触发或被取消）")
+    return {"ok": True, "message": f"已取消：{trigger_key}"}
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Phase 3: GET /api/agent/suggestions — @ 引用补全
 # ════════════════════════════════════════════════════════════════════════════
 
