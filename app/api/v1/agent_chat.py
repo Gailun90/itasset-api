@@ -1763,6 +1763,67 @@ async def cancel_agent_trigger(
     return {"ok": True, "message": f"已取消：{trigger_key}"}
 
 
+@router.post("/triggers")
+async def create_agent_trigger(
+    body: dict,
+    _: bool = Depends(require_glpi_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    人工新建一个定时/上线触发任务——AI 对话里创建之外的补救入口，
+    字段跟 schedule_task 工具完全一致，直接复用同一份逻辑，不重复实现。
+    """
+    result = await tool_schedule_task(
+        db,
+        name=body.get("name", ""),
+        task_type=body.get("task_type", "run_command"),
+        trigger_type=body.get("trigger_type", "online"),
+        client_ids=body.get("client_ids") or [],
+        command=body.get("command"),
+        scheduled_at=body.get("scheduled_at"),
+        priority=body.get("priority", "normal"),
+        interpreter=body.get("interpreter", "powershell"),
+    )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.put("/triggers/{trigger_key}")
+async def update_agent_trigger(
+    trigger_key: str,
+    body: dict,
+    _: bool = Depends(require_glpi_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    编辑一个还没触发的定时/上线任务——AI 有时候会把命令/目标终端/时间安排错，
+    这里让人工可以直接改，不用先删了再让 AI 重新建一遍。
+    """
+    from app.models.models import SystemSetting
+    if not trigger_key.startswith("agent.trigger."):
+        raise HTTPException(status_code=400, detail="非法的 trigger key")
+
+    result = await db.execute(select(SystemSetting).where(SystemSetting.key == trigger_key))
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="未找到该触发任务（可能已经触发或被取消）")
+
+    try:
+        data = json.loads(row.value) if row.value else {}
+    except json.JSONDecodeError:
+        data = {}
+
+    for field in ("name", "task_type", "command", "interpreter", "priority", "client_ids", "scheduled_at"):
+        if field in body:
+            data[field] = body[field]
+
+    row.value = json.dumps(data, ensure_ascii=False)
+    row.updated_by = "admin_edit"
+    await db.commit()
+    return {"ok": True, "message": f"已更新：{trigger_key}", "data": data}
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 3: GET /api/agent/suggestions — @ 引用补全
 # ════════════════════════════════════════════════════════════════════════════
