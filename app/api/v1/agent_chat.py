@@ -441,6 +441,13 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "命令内容（run_command 时必填）",
                     },
+                    "interpreter": {
+                        "type": "string",
+                        "enum": ["powershell", "cmd", "bat"],
+                        "description": "命令解释器。PowerShell 语法（如 Remove-Item、Get-Process 等）必须选 powershell，"
+                                        "否则终端会用 cmd 执行，报\"不是内部或外部命令\"直接失败。",
+                        "default": "powershell",
+                    },
                     "scheduled_at": {
                         "type": "string",
                         "description": "定时执行时间（ISO 8601 格式，scheduled 时必填）",
@@ -1113,8 +1120,15 @@ async def tool_schedule_task(
     command: str = None,
     scheduled_at: str = None,
     priority: str = "normal",
+    interpreter: str = "powershell",
 ) -> dict:
-    """创建定时或触发式任务"""
+    """创建定时或触发式任务
+
+    修复：此前无论 immediate/online/scheduled 三种触发方式，创建 Task 时都没有
+    设置 interpreter 字段，客户端会用默认解释器（cmd）去跑命令——如果命令是
+    PowerShell 语法（比如 Remove-Item），cmd 会直接报"不是内部或外部命令"，
+    执行必然失败。跟 tool_shell_exec 保持一致，默认用 powershell。
+    """
     if task_type == "run_command" and not command:
         return {"error": "run_command 任务需要 command 参数"}
 
@@ -1124,6 +1138,7 @@ async def tool_schedule_task(
             name=name,
             task_type=task_type,
             command=command,
+            interpreter=interpreter,
             target_type="client",
             interactive=False,
             need_reboot=False,
@@ -1151,6 +1166,7 @@ async def tool_schedule_task(
             "name": name,
             "task_type": task_type,
             "command": command,
+            "interpreter": interpreter,
             "client_ids": client_ids or [],
             "priority": priority,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1177,6 +1193,7 @@ async def tool_schedule_task(
             "name": name,
             "task_type": task_type,
             "command": command,
+            "interpreter": interpreter,
             "client_ids": client_ids or [],
             "priority": priority,
             "scheduled_at": scheduled_at,
@@ -2021,6 +2038,7 @@ async def _consume_online_triggers(client_id: int, serial: str, db: AsyncSession
                 name=data.get("name", "在线触发任务"),
                 task_type=data.get("task_type", "run_command"),
                 command=data.get("command"),
+                interpreter=data.get("interpreter", "powershell"),
                 target_type="client",
                 interactive=False,
                 need_reboot=False,
@@ -2212,6 +2230,7 @@ async def _check_scheduled_triggers(db: AsyncSession):
                 name=data["name"],
                 task_type=data["task_type"],
                 command=data.get("command"),
+                interpreter=data.get("interpreter", "powershell"),
                 target_type="client",
                 interactive=False,
                 need_reboot=False,
