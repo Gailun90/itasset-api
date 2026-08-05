@@ -25,7 +25,7 @@ from fastapi import (
     Form, Query as FastQuery,
 )
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, update, delete as sqldelete, and_, or_, Text, String, Integer, Boolean, DateTime, Index
+from sqlalchemy import select, func, update, delete as sqldelete, text, and_, or_, Text, String, Integer, Boolean, DateTime, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -114,6 +114,13 @@ BASE_SYSTEM_PROMPT = """你是企业终端安全运维 Agent，部署在 IT 资�
 9. **批准/拒绝/取消/删除任务**（manage_task）：对漏洞修复任务执行状态变更或删除
 10. **修改任务动作**（update_task）：更新修复任务的动作内容（如注册表修改值、命令等）
 11. **查看终端软件清单**（get_client_software）：直接从数据库获取终端已安装的软件列表（无需远程命令）
+12. **查询定时/上线触发任务**（list_scheduled_tasks）：查看所有还没触发完的任务，包括每个任务当前关联的
+    目标终端列表——想回答"之前那个任务关联了哪些终端"这类问题，必须先调用这个，不要说"没有查询接口"
+13. **修改定时/上线触发任务**（update_scheduled_task）：改任务名/命令/解释器/优先级/目标终端/执行时间，
+    改之前必须先用 list_scheduled_tasks 拿到真实 trigger_key，不要凭空编造
+14. **取消定时/上线触发任务**（cancel_scheduled_task）：取消一个还没触发的任务
+15. **只读数据库查询**（query_database）：以上工具都覆盖不到的信息需求时的兜底手段，只能执行单条
+    SELECT，数据库层面强制只读，任何写操作都会被拒绝
 
 ## 使用规则
 
@@ -460,6 +467,68 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["name", "task_type", "trigger_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_scheduled_tasks",
+            "description": "查询所有还没触发完的定时/上线任务，包括每个任务当前关联的目标终端列表、命令、"
+                            "解释器、优先级等完整信息。想回答'之前那个任务关联了哪些终端'，或者要修改/取消"
+                            "某个任务之前，都必须先调用这个查一遍确认是哪一条，不要凭空猜 trigger_key。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_scheduled_task",
+            "description": "修改一个还没触发的定时/上线任务。只会更新你传入的字段，没传的字段保持原样。"
+                            "trigger_key 必须是 list_scheduled_tasks 返回的真实值。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trigger_key": {"type": "string", "description": "要修改的任务 key（从 list_scheduled_tasks 获取）"},
+                    "name": {"type": "string", "description": "任务名称"},
+                    "command": {"type": "string", "description": "命令内容"},
+                    "interpreter": {"type": "string", "enum": ["powershell", "cmd", "bat"], "description": "命令解释器"},
+                    "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
+                    "client_ids": {"type": "array", "items": {"type": "integer"}, "description": "目标终端 ID 列表（会整体替换，不是追加）"},
+                    "scheduled_at": {"type": "string", "description": "定时执行时间（ISO 8601，仅 scheduled 类型有意义）"},
+                },
+                "required": ["trigger_key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_scheduled_task",
+            "description": "取消一个还没触发的定时/上线任务。trigger_key 必须是 list_scheduled_tasks 返回的真实值。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trigger_key": {"type": "string", "description": "要取消的任务 key"},
+                },
+                "required": ["trigger_key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_database",
+            "description": "只读数据库查询，覆盖没有专门工具的临时性信息需求（比如统计、多表关联查询）。"
+                            "只能执行单条 SELECT 语句，数据库连接本身在只读事务里运行，任何写操作都会被数据库"
+                            "引擎直接拒绝，不是靠你自觉。优先使用其它专门的工具（如 list_tasks/list_rules 等），"
+                            "只有确实没有对应工具时才用这个。表名/字段名不确定时，可以先查 information_schema。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "单条 SELECT 语句，不要带分号"},
+                },
+                "required": ["sql"],
             },
         },
     },
@@ -1215,6 +1284,108 @@ async def tool_schedule_task(
     return {"error": f"未知触发类型: {trigger_type}"}
 
 
+async def tool_list_scheduled_tasks(db: AsyncSession, **_) -> dict:
+    """
+    查询所有还没触发完的定时/上线任务，包括每个任务当前关联的目标终端列表。
+    用来回答"我之前安排的 XXX 任务关联了哪些终端"这类问题，
+    也是修改/取消前必须先查一遍、确认改的是哪一条的前置步骤。
+    """
+    triggers = await _get_agent_triggers(db)
+    return {"count": len(triggers), "triggers": triggers}
+
+
+async def tool_update_scheduled_task(
+    db: AsyncSession,
+    trigger_key: str,
+    name: str = None,
+    command: str = None,
+    interpreter: str = None,
+    priority: str = None,
+    client_ids: list[int] = None,
+    scheduled_at: str = None,
+) -> dict:
+    """修改一个还没触发的定时/上线任务（只更新传入的字段，其它保持不变）"""
+    from app.models.models import SystemSetting
+
+    if not trigger_key.startswith("agent.trigger."):
+        return {"error": "非法的 trigger_key"}
+
+    result = await db.execute(select(SystemSetting).where(SystemSetting.key == trigger_key))
+    row = result.scalar_one_or_none()
+    if not row:
+        return {"error": f"未找到该任务（可能已经触发或被取消）: {trigger_key}"}
+
+    try:
+        data = json.loads(row.value) if row.value else {}
+    except json.JSONDecodeError:
+        data = {}
+
+    updates = {
+        "name": name, "command": command, "interpreter": interpreter,
+        "priority": priority, "client_ids": client_ids, "scheduled_at": scheduled_at,
+    }
+    changed = {}
+    for k, v in updates.items():
+        if v is not None:
+            data[k] = v
+            changed[k] = v
+
+    row.value = json.dumps(data, ensure_ascii=False)
+    row.updated_by = "agent"
+    await db.commit()
+    return {"ok": True, "trigger_key": trigger_key, "changed": changed, "message": f"已更新：{data.get('name')}"}
+
+
+async def tool_cancel_scheduled_task(db: AsyncSession, trigger_key: str) -> dict:
+    """取消一个还没触发的定时/上线任务"""
+    from app.models.models import SystemSetting
+
+    if not trigger_key.startswith("agent.trigger."):
+        return {"error": "非法的 trigger_key"}
+
+    result = await db.execute(sqldelete(SystemSetting).where(SystemSetting.key == trigger_key))
+    await db.commit()
+    if result.rowcount == 0:
+        return {"error": f"未找到该任务（可能已经触发或被取消）: {trigger_key}"}
+    return {"ok": True, "message": f"已取消：{trigger_key}"}
+
+
+async def tool_query_database(db: AsyncSession, sql: str, params: dict = None) -> dict:
+    """
+    只读数据库查询——覆盖没有专门工具的临时性信息需求。
+    安全边界：在真正执行前用 `SET TRANSACTION READ ONLY` 把当前事务设成
+    只读，这是 PostgreSQL 引擎自己强制的，不是靠正则/关键字黑名单猜——
+    哪怕语句本身被拼接/绕过检测，Postgres 也会直接拒绝任何写操作。
+    另外做的收紧：只允许单条 SELECT 语句、禁止分号叠加多条语句、结果行数上限 200、
+    执行超时 10 秒，事务结束后强制 rollback（只读事务本来就没什么好 commit 的）。
+    """
+    stripped = sql.strip().rstrip(";").strip()
+    if not stripped:
+        return {"error": "SQL 不能为空"}
+    if ";" in stripped:
+        return {"error": "只允许单条语句，不能包含分号（防止语句叠加）"}
+    first_word = stripped.split(None, 1)[0].lower() if stripped.split() else ""
+    if first_word not in ("select", "with"):
+        return {"error": "只允许 SELECT / WITH ... SELECT 查询语句"}
+
+    try:
+        await db.execute(text("SET LOCAL statement_timeout = '10s'"))
+        await db.execute(text("SET TRANSACTION READ ONLY"))
+        result = await db.execute(text(stripped), params or {})
+        rows = result.mappings().all()
+        truncated = len(rows) > 200
+        rows = rows[:200]
+        return {
+            "row_count": len(rows),
+            "truncated": truncated,
+            "rows": [dict(r) for r in rows],
+        }
+    except Exception as e:
+        return {"error": f"查询失败: {e}"}
+    finally:
+        await db.rollback()
+
+
 async def tool_set_priority(
     db: AsyncSession,
     task_id: int,
@@ -1344,6 +1515,10 @@ TOOL_FUNCTIONS = {
     "update_rule": tool_update_rule,
     "manage_package": tool_manage_package,
     "schedule_task": tool_schedule_task,
+    "list_scheduled_tasks": tool_list_scheduled_tasks,
+    "update_scheduled_task": tool_update_scheduled_task,
+    "cancel_scheduled_task": tool_cancel_scheduled_task,
+    "query_database": tool_query_database,
     "set_priority": tool_set_priority,
     "manage_task": tool_manage_task,
     "update_task": tool_update_task,
@@ -1688,14 +1863,12 @@ def _sse(data: dict) -> str:
 # GET/DELETE /api/agent/triggers — AI 定时/上线触发任务列表（前台"软件分发"菜单下的展示页用）
 # ════════════════════════════════════════════════════════════════════════════
 
-@router.get("/triggers")
-async def list_agent_triggers(
-    _: bool = Depends(require_glpi_token),
-    db: AsyncSession = Depends(get_db),
-):
+async def _get_agent_triggers(db: AsyncSession) -> list[dict]:
     """
     列出所有还没触发完的 AI 定时/上线任务（schedule_task 工具写入的
     agent.trigger.scheduled.* / agent.trigger.online.* 记录）。
+    被 GET /api/agent/triggers 和 AI 工具 list_scheduled_tasks 共用，
+    避免逻辑重复导致两边行为不一致。
     """
     from app.models.models import SystemSetting, Client
 
@@ -1704,7 +1877,6 @@ async def list_agent_triggers(
     )
     rows = result.scalars().all()
 
-    # 批量取 client 主机名，避免逐条查询
     all_client_ids: set[int] = set()
     parsed_rows = []
     for r in rows:
@@ -1732,6 +1904,7 @@ async def list_agent_triggers(
             "name": data.get("name", "(未命名)"),
             "task_type": data.get("task_type"),
             "command": data.get("command"),
+            "interpreter": data.get("interpreter"),
             "priority": data.get("priority"),
             "scheduled_at": data.get("scheduled_at"),
             "created_at": data.get("created_at"),
@@ -1743,7 +1916,15 @@ async def list_agent_triggers(
         })
 
     triggers.sort(key=lambda t: t.get("created_at") or "", reverse=True)
-    return {"triggers": triggers}
+    return triggers
+
+
+@router.get("/triggers")
+async def list_agent_triggers(
+    _: bool = Depends(require_glpi_token),
+    db: AsyncSession = Depends(get_db),
+):
+    return {"triggers": await _get_agent_triggers(db)}
 
 
 @router.delete("/triggers/{trigger_key}")
