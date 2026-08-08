@@ -242,11 +242,16 @@ async def delete_package(
     if not pkg:
         raise HTTPException(status_code=404, detail="包不存在")
 
-    # 删除磁盘文件（不存在也不报错）
+    # 删除磁盘文件（不存在也不报错；权限/IO 异常时仅告警并继续删除数据库记录，避免整请求 500）
     file_path = PKG_DIR / pkg.filename
     if file_path.exists():
-        file_path.unlink()
-        logger.info(f"Package file deleted: {pkg.filename}")
+        try:
+            file_path.unlink()
+            logger.info(f"Package file deleted: {pkg.filename}")
+        except OSError as e:
+            logger.warning(
+                f"无法删除安装包文件（权限/IO 问题），仅删除数据库记录：{pkg.filename} - {e}"
+            )
 
     await db.delete(pkg)
     await db.commit()

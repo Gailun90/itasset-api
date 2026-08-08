@@ -19,3 +19,6 @@ tls/
 backups/
 workspace/
 tmp/
+
+# 私钥文件不入库
+certs/*.key
