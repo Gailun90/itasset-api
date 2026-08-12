@@ -176,7 +176,7 @@ async def agent_websocket(
                     await ws_manager.broadcast_to_remote_viewers(
                         serial, msg)
 
-                elif msg_type in ("viewer_ready", "remote_started"):
+                elif msg_type in ("viewer_ready", "remote_started", "remote_unavailable", "agent_offline"):
                     await ws_manager.broadcast_to_remote_viewers(
                         serial, msg)
                 else:
