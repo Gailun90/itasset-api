@@ -52,8 +52,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ITAsset API",
-    description="IT 资产管理与 AD 域管控系统 — FastAPI 服务端 v1.0.0",
-    version="1.0.0",
+    description="IT 资产管理与 AD 域管控系统 — FastAPI 服务端 v6.0.0",
+    version="6.0.0",
     lifespan=lifespan,
 )
 
@@ -119,4 +119,4 @@ app.include_router(agent_chat.router)
 @app.get("/health")
 async def health():
     """健康检查（TODO: 应检查数据库、Redis 等依赖）"""
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "6.0.0"}
